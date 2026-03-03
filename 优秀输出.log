@@ -1,0 +1,36 @@
+2026-03-03 08:43:26 | INFO     | 请求响应 | {
+  "timestamp": "2026-03-03T08:43:26.174685",
+  "session_id": "eval_w30022769_EV-01_1772498591233728250",
+  "request_message": "你好",
+  "response_content": "您好！我是智能租房助手，请问有什么可以帮您？"
+}
+2026-03-03 08:43:40 | INFO     | 请求响应 | {
+  "timestamp": "2026-03-03T08:43:40.162222",
+  "session_id": "eval_w30022769_EV-02_1772498601131403860",
+  "request_message": "你好，你可以做什么",
+  "response_content": "您好！我是智能租房助手，帮您找房、查房、租房"
+}
+2026-03-03 08:43:53 | INFO     | 请求响应 | {
+  "timestamp": "2026-03-03T08:43:53.539369",
+  "session_id": "eval_w30022769_EV-03_1772498615118000430",
+  "request_message": "找大兴区的两居室，租金4000元以下。",
+  "response_content": "{\"message\": \"为您找到5套房源，价格请查看详情\", \"houses\": [\"HF_6\", \"HF_277\", \"HF_805\", \"HF_1069\", \"HF_1333\"], \"total_count\": 5, \"original_count\": 6, \"limited_by_max\": true, \"search_status\": \"success\", \"timestamp\": 1772498633}"
+}
+2026-03-03 08:44:04 | INFO     | 请求响应 | {
+  "timestamp": "2026-03-03T08:44:04.041486",
+  "session_id": "eval_w30022769_EV-04_1772498628477014052",
+  "request_message": "想要80平以上的，两居或三居，租金别超过4000",
+  "response_content": "请问您想在哪个区域租房？"
+}
+2026-03-03 08:44:25 | INFO     | 请求响应 | {
+  "timestamp": "2026-03-03T08:44:25.686470",
+  "session_id": "eval_w30022769_EV-05_1772498638996450959",
+  "request_message": "找海淀区三居室，预算13000以里，精装修，近地铁",
+  "response_content": "{\"message\": \"暂无符合条件的房源，建议调整筛选条件\", \"houses\": [], \"total_count\": 0, \"original_count\": 0, \"limited_by_max\": false, \"search_status\": \"no_results\", \"timestamp\": 1772498665}"
+}
+2026-03-03 08:44:38 | INFO     | 请求响应 | {
+  "timestamp": "2026-03-03T08:44:38.694322",
+  "session_id": "eval_w30022769_EV-06_1772498660642374686",
+  "request_message": "我想在望京租一套两居室，预算8000以内，有电梯",
+  "response_content": "{\"message\": \"暂无符合条件的房源，建议调整筛选条件\", \"houses\": [], \"total_count\": 0, \"original_count\": 0, \"limited_by_max\": false, \"search_status\": \"no_results\", \"timestamp\": 1772498678}"
+}

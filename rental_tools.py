@@ -3,11 +3,23 @@
 请求头 X-User-ID 使用 session_id（或评测下发的用户工号）。
 """
 import json
+import time
 from typing import Any
 
 import httpx
 
 from config import FAKE_APP_BASE_URL
+from logger import log_tool_call, log_tool_result, tool_log
+
+# 全局复用 httpx 客户端
+_api_client: httpx.AsyncClient | None = None
+
+
+def _get_api_client() -> httpx.AsyncClient:
+    global _api_client
+    if _api_client is None or _api_client.is_closed:
+        _api_client = httpx.AsyncClient(timeout=30.0)
+    return _api_client
 
 
 def _headers(user_id: str, need_user_id: bool = True) -> dict:
@@ -18,27 +30,51 @@ def _headers(user_id: str, need_user_id: bool = True) -> dict:
 
 
 async def _get(url: str, params: dict | None, user_id: str, need_user_id: bool = True) -> str:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.get(url, params=params or {}, headers=_headers(user_id, need_user_id))
-        r.raise_for_status()
-        return r.text
+    client = _get_api_client()
+    tool_log.debug("[HTTP_GET] url=%s params=%s user=%s", url, params, user_id)
+    r = await client.get(url, params=params or {}, headers=_headers(user_id, need_user_id))
+    r.raise_for_status()
+    tool_log.debug("[HTTP_RESP] url=%s status=%d body=%s", url, r.status_code, r.text[:2000])
+    return r.text
 
 
 async def _post(url: str, user_id: str, need_user_id: bool = True) -> str:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=_headers(user_id, need_user_id))
-        r.raise_for_status()
-        return r.text
+    client = _get_api_client()
+    tool_log.debug("[HTTP_POST] url=%s user=%s", url, user_id)
+    r = await client.post(url, headers=_headers(user_id, need_user_id))
+    r.raise_for_status()
+    tool_log.debug("[HTTP_RESP] url=%s status=%d body=%s", url, r.status_code, r.text[:2000])
+    return r.text
 
 
 async def init_houses(user_id: str) -> str:
     """新会话时调用：重置当前用户视角下的房源数据。"""
+    tool_log.info("[INIT] user=%s 初始化房源数据", user_id)
     url = f"{FAKE_APP_BASE_URL}/api/houses/init"
-    return await _post(url, user_id=user_id)
+    result = await _post(url, user_id=user_id)
+    tool_log.info("[INIT] user=%s 完成, result=%s", user_id, result[:500])
+    return result
 
 
 async def run_tool(tool_name: str, arguments: dict[str, Any], user_id: str) -> str:
     """根据 tool_name 和 arguments 调用租房仿真 API，返回结果 JSON 字符串。"""
+    log_tool_call(user_id, tool_name, arguments)
+    t0 = time.time()
+
+    try:
+        result = await _dispatch_tool(tool_name, arguments, user_id)
+        dur = int((time.time() - t0) * 1000)
+        success = "error" not in result.lower()[:200]
+        log_tool_result(user_id, tool_name, dur, result, success)
+        return result
+    except Exception as exc:
+        dur = int((time.time() - t0) * 1000)
+        err_msg = json.dumps({"error": str(exc)})
+        log_tool_result(user_id, tool_name, dur, err_msg, False)
+        raise
+
+
+async def _dispatch_tool(tool_name: str, arguments: dict[str, Any], user_id: str) -> str:
     base = FAKE_APP_BASE_URL.rstrip("/")
 
     if tool_name == "get_landmarks":
@@ -57,10 +93,6 @@ async def run_tool(tool_name: str, arguments: dict[str, Any], user_id: str) -> s
     if tool_name == "get_landmark_by_id":
         id_ = arguments.get("id", "")
         url = f"{base}/api/landmarks/{id_}"
-        return await _get(url, None, user_id, need_user_id=False)
-
-    if tool_name == "get_landmark_stats":
-        url = f"{base}/api/landmarks/stats"
         return await _get(url, None, user_id, need_user_id=False)
 
     if tool_name == "get_house_by_id":
@@ -93,10 +125,6 @@ async def run_tool(tool_name: str, arguments: dict[str, Any], user_id: str) -> s
         params = {k: v for k, v in arguments.items() if v is not None}
         return await _get(url, params, user_id, need_user_id=True)
 
-    if tool_name == "get_house_stats":
-        url = f"{base}/api/houses/stats"
-        return await _get(url, None, user_id, need_user_id=True)
-
     if tool_name == "rent_house":
         house_id = arguments.get("house_id", "")
         listing_platform = arguments.get("listing_platform", "安居客")
@@ -125,12 +153,12 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_landmarks",
-                "description": "获取地标列表。支持按 category(subway/company/landmark)、district(如海淀、朝阳)筛选。",
+                "description": "查地标。category: subway/company/landmark, district: 行政区",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "category": {"type": "string", "description": "地标类别：subway/company/landmark"},
-                        "district": {"type": "string", "description": "行政区，如海淀、朝阳"},
+                        "category": {"type": "string"},
+                        "district": {"type": "string"},
                     },
                 },
             },
@@ -139,10 +167,10 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_landmark_by_name",
-                "description": "按名称精确查询地标，如西二旗站、百度。返回地标 id、经纬度等，用于后续 nearby 查房。",
+                "description": "按名查地标ID。name: 地标名",
                 "parameters": {
                     "type": "object",
-                    "properties": {"name": {"type": "string", "description": "地标名称"}},
+                    "properties": {"name": {"type": "string"}},
                     "required": ["name"],
                 },
             },
@@ -151,13 +179,13 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "search_landmarks",
-                "description": "关键词模糊搜索地标。q 必填；可选 category、district。",
+                "description": "搜地标。q: 关键词",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "q": {"type": "string", "description": "搜索关键词，必填"},
-                        "category": {"type": "string", "description": "subway/company/landmark"},
-                        "district": {"type": "string", "description": "行政区"},
+                        "q": {"type": "string"},
+                        "category": {"type": "string"},
+                        "district": {"type": "string"},
                     },
                     "required": ["q"],
                 },
@@ -167,10 +195,10 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_landmark_by_id",
-                "description": "按地标 id 查询地标详情。",
+                "description": "按ID查地标详情",
                 "parameters": {
                     "type": "object",
-                    "properties": {"id": {"type": "string", "description": "地标 ID"}},
+                    "properties": {"id": {"type": "string"}},
                     "required": ["id"],
                 },
             },
@@ -178,19 +206,11 @@ def get_tools_schema() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "get_landmark_stats",
-                "description": "获取地标统计信息（总数、按类别分布等）。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "get_house_by_id",
-                "description": "根据房源 ID 获取单套房源详情。",
+                "description": "查房源详情",
                 "parameters": {
                     "type": "object",
-                    "properties": {"house_id": {"type": "string", "description": "房源 ID，如 HF_2001"}},
+                    "properties": {"house_id": {"type": "string"}},
                     "required": ["house_id"],
                 },
             },
@@ -199,10 +219,10 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_house_listings",
-                "description": "根据房源 ID 获取该房源在各平台(链家/安居客/58同城)的全部挂牌记录。",
+                "description": "查房源挂牌记录",
                 "parameters": {
                     "type": "object",
-                    "properties": {"house_id": {"type": "string", "description": "房源 ID"}},
+                    "properties": {"house_id": {"type": "string"}},
                     "required": ["house_id"],
                 },
             },
@@ -211,11 +231,11 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_houses_by_community",
-                "description": "按小区名查询该小区下可租房源。",
+                "description": "查小区房源",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "community": {"type": "string", "description": "小区名"},
+                        "community": {"type": "string"},
                         "listing_platform": {"type": "string", "enum": ["链家", "安居客", "58同城"]},
                         "page": {"type": "integer"},
                         "page_size": {"type": "integer"},
@@ -228,26 +248,26 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_houses_by_platform",
-                "description": "按挂牌平台与多条件筛选可租房源。建议尽可能多地填充参数以精确匹配用户需求。",
+                "description": "条件查房。params: district, price, bedrooms, subway_dist, commute_to_xierqi_max...",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "listing_platform": {"type": "string", "enum": ["链家", "安居客", "58同城"]},
-                        "district": {"type": "string", "description": "行政区，逗号分隔，如 '海淀,朝阳'"},
-                        "area": {"type": "string", "description": "商圈，逗号分隔"},
-                        "min_price": {"type": "integer", "description": "最低月租金(元)"},
-                        "max_price": {"type": "integer", "description": "最高月租金(元)"},
-                        "bedrooms": {"type": "string", "description": "卧室数，逗号分隔如 '1,2'"},
-                        "rental_type": {"type": "string", "description": "整租或合租"},
-                        "decoration": {"type": "string", "description": "精装/简装等"},
-                        "orientation": {"type": "string", "description": "朝向，如 '朝南'"},
-                        "elevator": {"type": "string", "description": "是否有电梯：true/false"},
+                        "district": {"type": "string"},
+                        "area": {"type": "string"},
+                        "min_price": {"type": "integer"},
+                        "max_price": {"type": "integer"},
+                        "bedrooms": {"type": "string"},
+                        "rental_type": {"type": "string"},
+                        "decoration": {"type": "string"},
+                        "orientation": {"type": "string"},
+                        "elevator": {"type": "string"},
                         "min_area": {"type": "integer"},
                         "max_area": {"type": "integer"},
                         "subway_line": {"type": "string"},
-                        "max_subway_dist": {"type": "integer", "description": "最大地铁距离(米)。'近地铁'建议设为 800，'地铁可达'建议设为 1000"},
+                        "max_subway_dist": {"type": "integer"},
                         "subway_station": {"type": "string"},
-                        "commute_to_xierqi_max": {"type": "integer", "description": "到西二旗通勤时间上限(分钟)，如 30, 45, 60"},
+                        "commute_to_xierqi_max": {"type": "integer"},
                         "sort_by": {"type": "string", "enum": ["price", "area", "subway"]},
                         "sort_order": {"type": "string", "enum": ["asc", "desc"]},
                         "page": {"type": "integer"},
@@ -260,12 +280,12 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_houses_nearby",
-                "description": "以地标为圆心查附近可租房源。注意：必须先调用 get_landmark_by_name 或 search_landmarks 获取 landmark_id 后才能使用此工具。",
+                "description": "地标附近查房。landmark_id必填",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "landmark_id": {"type": "string", "description": "地标 ID (必填，非名称)"},
-                        "max_distance": {"type": "number", "description": "最大直线距离(米)，默认2000"},
+                        "landmark_id": {"type": "string"},
+                        "max_distance": {"type": "number"},
                         "listing_platform": {"type": "string", "enum": ["链家", "安居客", "58同城"]},
                         "page": {"type": "integer"},
                         "page_size": {"type": "integer"},
@@ -278,13 +298,13 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_nearby_landmarks",
-                "description": "查询某小区周边地标，用于判断生活便利程度（查商超）或环境（查公园）。",
+                "description": "查小区周边配套(商超/公园)",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "community": {"type": "string", "description": "小区名"},
-                        "type": {"type": "string", "description": "shopping(商超) 或 park(公园)"},
-                        "max_distance_m": {"type": "number", "description": "最大距离(米)，默认 3000"},
+                        "community": {"type": "string"},
+                        "type": {"type": "string", "description": "shopping/park"},
+                        "max_distance_m": {"type": "number"},
                     },
                     "required": ["community"],
                 },
@@ -293,16 +313,8 @@ def get_tools_schema() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "get_house_stats",
-                "description": "获取房源统计信息（总套数、按状态/行政区/户型分布、价格区间等）。",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "rent_house",
-                "description": "租房：将指定房源设为已租。必须调用此接口才算完成租房操作。",
+                "description": "租房操作",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -317,7 +329,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "terminate_rental",
-                "description": "退租：将房源恢复为可租。必须调用此接口才算完成退租。",
+                "description": "退租操作",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -332,7 +344,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "take_offline",
-                "description": "下架：将房源设为下架。必须调用此接口才算完成下架。",
+                "description": "下架操作",
                 "parameters": {
                     "type": "object",
                     "properties": {
