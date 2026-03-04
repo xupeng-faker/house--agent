@@ -726,6 +726,21 @@ _FILTER_KEYWORDS = {
 # 大型犬关键词：用户说这些时，需排除「仅限小型犬」房源
 _LARGE_DOG_KEYWORDS = ["金毛", "大型犬", "哈士奇", "德牧", "拉布拉多", "阿拉斯加"]
 
+# 排除型规则：(关键词列表, field, expected) — 用户说关键词时，房源含 expected 则 pass
+_EXCLUDE_RULES: list[tuple[list[str], str, Any]] = [
+    (["不额外收宠物押金", "不要宠物押金", "免宠物押金"], "tags", "可养宠物需宠物押金"),
+    (["免中介费", "不想交中介费", "不交中介费", "省中介费"], "tags", "收中介费"),
+    (["安静", "隔音", "睡眠浅", "怕吵", "不能吵"], "hidden_noise_level", "吵闹"),
+    (["线上VR看房", "线上看房", "不用跑现场", "VR看房"], "tags", "仅线下看房"),
+    (["周末看房", "只能周末看房"], "tags", "仅工作日看房"),
+    (["工作日看房", "工作日能看房", "工作日白天看房"], "tags", "仅周末看房"),
+    (["月付", "短租", "可租2个月", "可租3个月", "可月租"], "tags", "仅接受年租"),
+    (["包水电", "包水电费", "水电包在房租"], "tags", "水电费另付"),
+    (["包宽带", "包网费", "网费包", "宽带包"], "tags", "网费另付"),
+    (["包物业费", "物业费包"], "tags", "物业费另付"),
+    (["包车位", "免车位费", "车位包"], "tags", "车位费另付"),
+]
+
 
 def _get_filter_from_message(msg: str) -> tuple[str, Any] | None:
     """从消息提取追加筛选条件，返回 (field, expected) 或 None。"""
@@ -740,6 +755,9 @@ def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any, ...]]:
     specs: list[tuple[str, Any, ...]] = [(f, e) for kw, (f, e) in _FILTER_KEYWORDS.items() if kw in msg]
     if any(kw in msg for kw in _LARGE_DOG_KEYWORDS):
         specs.append(("tags", "仅限小型犬", True))  # exclude：大型犬时排除仅限小型犬
+    for keywords, field, expected in _EXCLUDE_RULES:
+        if any(kw in msg for kw in keywords):
+            specs.append((field, expected, True))
     return specs
 
 
