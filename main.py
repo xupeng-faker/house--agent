@@ -276,7 +276,7 @@ def _extract_house_ids_from_tool_output(output: str) -> list[str]:
 def _ensure_strict_json_response(text: str, valid_house_ids: set[str] | None = None) -> str:
     """最终兜底：规范为仅 message+houses 的 JSON，符合评测要求。"""
     if not text or not text.strip():
-        return text
+        return json.dumps({"message": "查询失败，请重试", "houses": []}, ensure_ascii=False)
     extracted = _try_extract_json(text)
     if extracted:
         return _clean_and_enforce_limit(extracted, valid_house_ids)
@@ -676,6 +676,9 @@ _FILTER_KEYWORDS = {
     "网费包": ["tags", "包宽带"],
     "宽带包": ["tags", "包宽带"],
     "网费包含": ["tags", "包宽带"],
+    "包网": ["tags", "包宽带"],
+    "不想交网费": ["tags", "包宽带"],
+    "不想额外再交网费": ["tags", "包宽带"],
     "附近有公园": ["tags", "近公园"],
     "近公园": ["tags", "近公园"],
     "附近有菜市场": ["tags", "近菜市场"],
@@ -686,6 +689,9 @@ _FILTER_KEYWORDS = {
     "附近有商场": ["tags", "近商超"],
     "附近有餐饮": ["tags", "近餐饮"],
     "附近有餐馆": ["tags", "近餐饮"],
+    "24小时有餐饮": ["tags", "近餐饮"],
+    "24小时有吃的": ["tags", "近餐饮"],
+    "小吃街": ["tags", "近餐饮"],
     "附近有警察局": ["tags", "近警察局"],
     "附近有派出所": ["tags", "近警察局"],
     "包宽带": ["tags", "包宽带"],
@@ -693,8 +699,11 @@ _FILTER_KEYWORDS = {
     "包水电费": ["tags", "包水电费"],
     "免水电费": ["tags", "免水电费"],
     "包物业费": ["tags", "包物业费"],
+    "物业费含在房租": ["tags", "包物业费"],
+    "物业费包在房租": ["tags", "包物业费"],
     "免物业费": ["tags", "免物业费"],
     "押一付一": ["tags", "月付"],  # 押一付一通常伴随月付
+    "押二付一": ["tags", "月付"],
     "押二": ["tags", "押二"],
     "月付": ["tags", "月付"],
     "押一": ["tags", "押一"],
@@ -703,8 +712,15 @@ _FILTER_KEYWORDS = {
     "可养猫": ["tags", "可养猫"],
     "养猫": ["tags", "可养猫"],
     "允许养猫": ["tags", "可养猫"],
+    "接受养猫": ["tags", "可养猫"],
+    "能接受养猫": ["tags", "可养猫"],
     "可养狗": ["tags", "可养狗"],
     "可养宠物": ["tags", "可养宠物"],
+    "能养宠物": ["tags", "可养宠物"],
+    "接受宠物": ["tags", "可养宠物"],
+    "能接受宠物": ["tags", "可养宠物"],
+    "养仓鼠": ["tags", "可养宠物"],
+    "仓鼠": ["tags", "可养宠物"],
     "养狗": ["tags", "可养狗"],
     "能养狗": ["tags", "可养狗"],
     "养金毛": ["tags", "可养狗"],
@@ -725,6 +741,12 @@ _FILTER_KEYWORDS = {
     "民水民电": ["utilities_type", "民水民电"],
     "地下车库": ["tags", "车库车位"],
     "有车库": ["tags", "车库车位"],
+    "地库车位": ["tags", "车库车位"],
+    "免费车位": ["tags", "免车位费"],
+    "车位免费": ["tags", "免车位费"],
+    "绿化好": ["tags", "绿化好环境佳"],
+    "下午看房": ["tags", "工作日14-18点"],
+    "下午能看房": ["tags", "工作日14-18点"],
 }
 
 # 大型犬关键词：用户说这些时，需排除「仅限小型犬」房源
@@ -736,15 +758,20 @@ _TAG_EQUIVALENTS: dict[str, list[str]] = {
     "包水电费": ["包水电费", "免水电费"],
     "包物业费": ["包物业费", "免物业费"],
     "包车位": ["包车位", "免车位费"],
+    "免车位费": ["免车位费", "包车位"],
     "可养猫": ["可养猫", "可养宠物"],
+    "工作日14-18点": ["工作日14-18点", "周末14-18点", "全天可看房", "周末9-18点", "工作日9-18点"],
 }
 
 # 排除型规则：(关键词列表, field, expected) — 用户说关键词时，房源含 expected 则 pass
 _EXCLUDE_RULES: list[tuple[list[str], str, Any]] = [
     (["不额外收宠物押金", "不要宠物押金", "免宠物押金"], "tags", "可养宠物需宠物押金"),
     (["养猫", "想养猫", "养只猫", "允许养猫"], "tags", "不可养宠物"),
+    (["不养宠物", "室友不养", "对宠物过敏", "不要养宠物"], "tags", "可养狗"),
+    (["不养宠物", "室友不养", "对宠物过敏", "不要养宠物"], "tags", "可养猫"),
+    (["不养宠物", "室友不养", "对宠物过敏", "不要养宠物"], "tags", "可养宠物"),
     (["免中介费", "不想交中介费", "不交中介费", "省中介费"], "tags", "收中介费"),
-    (["安静", "隔音", "睡眠浅", "怕吵", "不能吵"], "hidden_noise_level", "吵闹"),
+    (["安静", "隔音", "睡眠浅", "怕吵", "不能吵", "不隔音"], "hidden_noise_level", "吵闹"),
     (["线上VR看房", "线上看房", "不用跑现场", "VR看房"], "tags", "仅线下看房"),
     (["周末看房", "只能周末看房"], "tags", "仅工作日看房"),
     (["工作日看房", "工作日能看房", "工作日白天看房"], "tags", "仅周末看房"),
@@ -753,6 +780,9 @@ _EXCLUDE_RULES: list[tuple[list[str], str, Any]] = [
     (["包宽带", "包网费", "网费包", "宽带包"], "tags", "网费另付"),
     (["包物业费", "物业费包"], "tags", "物业费另付"),
     (["包车位", "免车位费", "车位包"], "tags", "车位费另付"),
+    (["实地看房", "线下看房", "去实地看房"], "tags", "仅线上VR看房"),
+    (["实地看房", "线下看房", "去实地看房"], "tags", "仅线上图片看房"),
+    (["实地看房", "线下看房", "去实地看房"], "tags", "仅线上AR看房"),
 ]
 
 
@@ -851,7 +881,7 @@ def _try_direct_search(msg: str) -> dict | None:
     # 仅排除以小区名为核心的查询（如「XX园有在租的吗」），不因公园/医院等附加条件排除
     if "在租" in msg and not any(kw in msg for kw in ["居室", "两居", "三居", "单间", "预算", "找房", "租房", "居"]):
         return None
-    if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看"]):
+    if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看", "希望", "想要"]):
         return None
 
     params: dict[str, Any] = {}
@@ -1360,6 +1390,22 @@ async def chat(req: ChatRequest) -> ChatResponse:
             tool_outputs.append(tool_msg)
             
         append_messages(session_id, *tool_outputs)
+
+    # 循环耗尽或 LLM 返回空时兜底：从 tool_results 合成响应
+    if not response_text or not response_text.strip():
+        valid_house_ids = set()
+        for tr in tool_results:
+            for hid in _extract_house_ids_from_tool_output(tr.get("output", "") or ""):
+                valid_house_ids.add(hid)
+        if valid_house_ids:
+            ids_list = list(valid_house_ids)[:5]
+            response_text = json.dumps(
+                {"message": f"为您找到{len(ids_list)}套符合条件的房源", "houses": ids_list},
+                ensure_ascii=False,
+            )
+        else:
+            response_text = json.dumps({"message": "查询失败，请重试", "houses": []}, ensure_ascii=False)
+        append_messages(session_id, {"role": "assistant", "content": response_text})
 
     duration_ms = int((time.time() - start_ts) * 1000)
     log_response(session_id, "success", duration_ms, response_text)
