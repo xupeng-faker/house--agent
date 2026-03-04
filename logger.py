@@ -22,6 +22,8 @@ _LOGGER_NAMES = ("service", "tool", "model_in", "model_out")
 _FMT = "%(asctime)s | %(name)-9s | %(levelname)-5s | %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
+_REQRESP_FMT = "%(asctime)s | %(levelname)-8s | %(message)s"
+
 
 def _make_file_handler(name: str) -> TimedRotatingFileHandler:
     path = os.path.join(LOG_DIR, f"{name}.log")
@@ -48,6 +50,21 @@ for _name in _LOGGER_NAMES:
     _logger.propagate = False
     _logger.addHandler(_console)
     _logger.addHandler(_make_file_handler(_name))
+
+
+_reqresp_logger = logging.getLogger("reqresp")
+_reqresp_logger.setLevel(LOG_LEVEL)
+_reqresp_logger.propagate = False
+_reqresp_console = logging.StreamHandler()
+_reqresp_console.setLevel(logging.DEBUG)
+_reqresp_console.setFormatter(logging.Formatter(_REQRESP_FMT, datefmt=_DATE_FMT))
+_reqresp_logger.addHandler(_reqresp_console)
+_reqresp_file = TimedRotatingFileHandler(
+    os.path.join(LOG_DIR, "reqresp.log"), when="midnight", interval=1, backupCount=7, encoding="utf-8",
+)
+_reqresp_file.setLevel(logging.DEBUG)
+_reqresp_file.setFormatter(logging.Formatter(_REQRESP_FMT, datefmt=_DATE_FMT))
+_reqresp_logger.addHandler(_reqresp_file)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -115,3 +132,14 @@ def log_model_output(session_id: str, response: dict, duration_ms: int) -> None:
         session_id, duration_ms,
         _safe_json(response),
     )
+
+
+def log_request_response(session_id: str, request_message: str, response_content: str) -> None:
+    from datetime import datetime
+    payload = json.dumps({
+        "timestamp": datetime.now().isoformat(),
+        "session_id": session_id,
+        "request_message": request_message,
+        "response_content": response_content,
+    }, ensure_ascii=False, indent=2)
+    _reqresp_logger.info("请求响应 | %s", payload)

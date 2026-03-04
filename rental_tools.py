@@ -207,7 +207,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_house_by_id",
-                "description": "查房源详情",
+                "description": "查房源详情，含价格、面积、朝向、装修、tags（如仅限小型犬、押一付三、包物业费、房东直租、可短租等）",
                 "parameters": {
                     "type": "object",
                     "properties": {"house_id": {"type": "string"}},
@@ -219,7 +219,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_house_listings",
-                "description": "查房源挂牌记录",
+                "description": "查房源在各平台(链家/安居客/58同城)的挂牌记录与价格。办理租房前若未指定平台，可先调用此接口获取挂牌平台列表，再选其一调用 rent_house。",
                 "parameters": {
                     "type": "object",
                     "properties": {"house_id": {"type": "string"}},
@@ -314,7 +314,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "rent_house",
-                "description": "租房操作",
+                "description": "执行租房操作。用户说「帮我办理租房」「就租这套」「帮我预约」「我就租了」时必须调用。平台未指定时先 get_house_listings 查挂牌平台再选其一，或默认安居客。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -329,7 +329,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "terminate_rental",
-                "description": "退租操作",
+                "description": "执行退租操作。用户说「帮我退掉」「退租」「不租了」时必须调用。平台未指定时先 get_house_listings 或默认安居客。",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -344,7 +344,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "take_offline",
-                "description": "下架操作",
+                "description": "执行下架操作。用户说「下架」时必须调用。",
                 "parameters": {
                     "type": "object",
                     "properties": {
