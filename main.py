@@ -18,6 +18,7 @@ from session_store import (
     get_messages,
     is_initialized,
     set_initialized,
+    set_messages,
 )
 
 app = FastAPI(title="租房 Agent", description="需求理解、房源筛选与推荐")
@@ -30,7 +31,7 @@ def root():
     return {"service": "租房 Agent", "chat": "POST /api/v1/chat"}
 
 
-MAX_TOOL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 3
 
 
 class ChatRequest(BaseModel):
@@ -294,17 +295,13 @@ def _fallback_extract_houses(text: str) -> str | None:
 
 
 def _extract_items(data: Any) -> list | None:
-    """从 API 返回的各种嵌套结构中提取 items 列表。
-    支持: {"items":[...]}, {"data":{"items":[...]}}, {"data":[...]}, [...]
-    """
+    """从 API 返回的各种嵌套结构中提取 items 列表。"""
     if isinstance(data, list):
         return data
     if not isinstance(data, dict):
         return None
-    # 直接有 items
     if "items" in data and isinstance(data["items"], list):
         return data["items"]
-    # 嵌套在 data 下
     inner = data.get("data")
     if isinstance(inner, list):
         return inner
@@ -322,33 +319,27 @@ def _compress_tool_output(tool_name: str, output: str) -> str:
         return output[:1000]
 
     items = _extract_items(data)
-
+    
+    # 2026-03-04 重构：CSV 格式压缩，大幅降低 token 消耗
     if items is not None and len(items) > 0 and isinstance(items[0], dict):
-        slim_items = []
-        for item in items:
-            slim_item = {
-                "id": item.get("house_id") or item.get("id"),
-                "price": item.get("price"),
-                "area": item.get("area"),
-                "district": item.get("district"),
-                "subway": item.get("subway_distance"),
-                "bed": item.get("bedrooms"),
-                "floor": item.get("floor"),
-                "type": item.get("rental_type"),
-                "orient": item.get("orientation"),
-                "deco": item.get("decoration"),
-                "elev": item.get("elevator"),
-                "comm": item.get("community"),
-                "noise": item.get("noise_level"),
-                "avail": item.get("available_date"),
-                "tags": item.get("tags"),
-                "platform": item.get("listing_platform") or item.get("platform"),
-                "status": item.get("status"),
-            }
-            slim_items.append({k: v for k, v in slim_item.items() if v is not None})
-        return json.dumps(slim_items, ensure_ascii=False)
+        header = "id|price|area|dist|subway|bed|type|decor|tags"
+        rows = [header]
+        for item in items[:10]: # 限制最多 10 条
+            hid = str(item.get("house_id") or item.get("id") or "")
+            price = str(item.get("price") or "")
+            area = str(item.get("area") or "")
+            dist = str(item.get("district") or "")
+            sub = str(item.get("subway_distance") or "")
+            bed = str(item.get("bedrooms") or "")
+            typ = str(item.get("rental_type") or "")
+            deco = str(item.get("decoration") or "")
+            tags = ",".join((item.get("tags") or [])[:2])  # 仅取前2个tag
+            
+            row = f"{hid}|{price}|{area}|{dist}|{sub}|{bed}|{typ}|{deco}|{tags}"
+            rows.append(row)
+        return "\n".join(rows)
 
-    return output[:1500]
+    return output[:1000]
 
 
 # --------------- 短路与意图预处理 ---------------
@@ -364,8 +355,9 @@ _COMMUTE_RE = re.compile(r"通勤\s*(\d{1,3})\s*分钟")
 _SUBWAY_LINE_RE = re.compile(r"(\d{1,2})号线")
 _SUBWAY_DIST_RE = re.compile(r"(\d{3,4})\s*(?:米|m)(?:以?内)?")
 _PLATFORMS = {"链家": "链家", "安居客": "安居客", "58同城": "58同城", "58": "58同城"}
-# 地标/商圈 -> 行政区，用于无明确区域时的推断
-_LANDMARK_DISTRICT = {"望京南": "朝阳", "望京": "朝阳", "立水桥": "朝阳", "双合站": "朝阳", "金融街": "西城", "西二旗": "海淀", "车公庄": "西城"}
+_LANDMARK_DISTRICT = {"望京南": "朝阳", "望京": "朝阳", "立水桥": "朝阳", "双合站": "朝阳", "金融街": "西城", "西二旗": "海淀", "车公庄": "西城", "中关村": "海淀"}
+_COMMUNITY_RE = re.compile(r"^(.+?)(?:有)?在租", re.IGNORECASE)
+_LANDMARK_DIST_RE = re.compile(r"(\d{3,4})\s*米", re.IGNORECASE)
 
 
 def _extract_requirements_summary(messages: list[dict]) -> str | None:
@@ -391,32 +383,30 @@ def _extract_requirements_summary(messages: list[dict]) -> str | None:
         parts.append("整租")
     elif "合租" in all_text:
         parts.append("合租")
+    
+    # 扩展标签提取
     extras = []
-    if any(kw in all_text for kw in ["养狗", "养猫", "宠物", "金毛"]):
-        extras.append("养宠物")
-    if any(kw in all_text for kw in ["不养宠物", "不养狗", "不养猫", "室友不养"]):
-        extras.append("禁止宠物")
-    if any(kw in all_text for kw in ["公园", "遛狗"]):
-        extras.append("近公园")
-    if any(kw in all_text for kw in ["VR", "线上看房", "不用跑现场"]):
-        extras.append("线上看房")
-    if any(kw in all_text for kw in ["月付", "押一付一"]):
-        extras.append("月付")
-    if any(kw in all_text for kw in ["房东直租", "无中介"]):
-        extras.append("房东直租")
-    if any(kw in all_text for kw in ["电梯", "有电梯"]):
-        extras.append("需电梯")
-    if any(kw in all_text for kw in ["民水民电", "民电"]):
-        extras.append("民水民电")
-    if any(kw in all_text for kw in ["租2个月", "租3个月", "短租", "可月租"]):
-        extras.append("短租期")
-    if any(kw in all_text for kw in ["链家", "安居客", "58"]):
-        extras.append("平台偏好")
+    keywords = {
+        "养宠物": ["养狗", "养猫", "宠物", "金毛"],
+        "禁止宠物": ["不养宠物", "不养狗", "不养猫", "室友不养"],
+        "近公园": ["公园", "遛狗"],
+        "线上看房": ["VR", "线上看房", "不用跑现场"],
+        "月付": ["月付", "押一付一"],
+        "房东直租": ["房东直租", "无中介"],
+        "需电梯": ["电梯", "有电梯"],
+        "民水民电": ["民水民电", "民电"],
+        "短租期": ["租2个月", "租3个月", "短租", "可月租"],
+        "平台偏好": ["链家", "安居客", "58"]
+    }
+    for label, kws in keywords.items():
+        if any(kw in all_text for kw in kws):
+            extras.append(label)
+            
     if extras:
         parts.append("其他=" + "、".join(extras))
     if not parts:
         return None
-    return "当前已确认需求：" + "，".join(parts)
+    return "已确认需求：" + "，".join(parts)
 
 
 def _extract_last_house_ids(messages: list[dict]) -> list[str]:
@@ -440,38 +430,197 @@ def _extract_last_house_ids(messages: list[dict]) -> list[str]:
 def _try_canned_response(msg: str) -> str | None:
     """尝试匹配基础对话，返回固定回复或 None。"""
     msg_lower = msg.lower().strip()
-    
-    # 纯打招呼
     if msg_lower in ["你好", "hello", "hi", "嗨", "您好", "你好呀", "hi~", "hello~"]:
         return "您好！我是智能租房助手，请问有什么可以帮您？"
     
-    # 能力/自我介绍询问（可能和问候组合，如 "你好，你可以做什么"）
     capability_kws = ["你可以做什么", "你是谁", "你能做什么", "你的功能", "你能帮我做什么", "你会什么"]
     if any(x in msg_lower for x in capability_kws):
         return "您好！我是智能租房助手，帮您找房、查房、租房"
     
-    # 道谢/结束
     if msg_lower in ["谢谢", "感谢", "多谢", "谢了", "thanks", "thank you", "好的谢谢"]:
         return "不客气，如有其他需求随时联系我！"
     if msg_lower in ["再见", "拜拜", "bye", "结束"]:
         return "再见，祝您找到满意的房子！"
-    
     return None
+
+
+# 租房/比价短路：匹配「就租第一套」「最便宜平台」等
+_RENT_FIRST_PATTERNS = (
+    "就租第一套", "就定第一套", "就选第一套", "就租第一套吧", "就定第一套，我要租",
+    "就定第一套，我们租", "就选第一套吧", "就第一套吧", "就第一套吧，我们要租",
+    "就选最便宜的那个平台，我要租这套", "就选最便宜的平台", "我要租这套",
+)
+_COMPARE_PRICE_PATTERNS = (
+    "第一套在各大平台上的挂牌价", "哪个最便宜", "各大平台上的挂牌价",
+)
+
+
+def _is_rent_or_compare_intent(msg: str) -> tuple[str | None, bool]:
+    """返回 (intent, wants_rent)。intent: 'rent'|'compare'|None, wants_rent: 是否要执行租房。"""
+    msg_strip = msg.strip()
+    for p in _RENT_FIRST_PATTERNS:
+        if p in msg_strip:
+            return ("rent", "租" in msg_strip or "定" in msg_strip or "选" in msg_strip)
+    for p in _COMPARE_PRICE_PATTERNS:
+        if p in msg_strip and "第一套" in msg_strip:
+            return ("compare", False)
+    return (None, False)
+
+
+async def _do_rent_or_compare_shortcut(
+    last_house_ids: list[str], user_message: str, user_id: str
+) -> tuple[str, list[dict]] | None:
+    """租房/比价短路：零 LLM。返回 (response_json, tool_results) 或 None。"""
+    if not last_house_ids:
+        return None
+    house_id = last_house_ids[0]
+    if _is_likely_fake_house_id(house_id):
+        return None
+
+    intent, wants_rent = _is_rent_or_compare_intent(user_message)
+    if not intent:
+        return None
+
+    tool_results: list[dict] = []
+    try:
+        raw_listings = await run_tool("get_house_listings", {"house_id": house_id}, user_id)
+        tool_results.append({"name": "get_house_listings", "success": "error" not in raw_listings.lower()[:200], "output": raw_listings[:2000]})
+    except Exception as e:
+        service_log.warning("[RENT_SHORT] get_house_listings 失败: %s", e)
+        return None
+
+    try:
+        data = json.loads(raw_listings)
+    except json.JSONDecodeError:
+        return None
+
+    # 解析挂牌列表，选最便宜平台（API 返回 data.items）
+    listings = _extract_items(data) or data.get("listings") or data.get("items") or []
+    if isinstance(listings, dict):
+        listings = list(listings.values()) if listings else []
+    cheapest_platform = "安居客"
+    cheapest_price = float("inf")
+    price_lines: list[str] = []
+    for item in (listings or []):
+        if not isinstance(item, dict):
+            continue
+        plat = item.get("listing_platform") or item.get("platform") or ""
+        price = item.get("price") or item.get("rent") or 0
+        try:
+            p = int(price)
+        except (TypeError, ValueError):
+            continue
+        price_lines.append(f"{plat} {p}元")
+        if p < cheapest_price:
+            cheapest_price = p
+            cheapest_platform = plat or "安居客"
+
+    if intent == "compare" and not wants_rent:
+        msg = "、".join(price_lines) if price_lines else "暂无挂牌信息"
+        if cheapest_platform and cheapest_price != float("inf"):
+            msg = f"{msg}。最便宜为{cheapest_platform}，{cheapest_price}元/月"
+        result = json.dumps({"message": msg, "houses": [house_id]}, ensure_ascii=False)
+        return (result, tool_results)
+
+    if wants_rent:
+        try:
+            raw_rent = await run_tool("rent_house", {"house_id": house_id, "listing_platform": cheapest_platform}, user_id)
+            tool_results.append({"name": "rent_house", "success": "error" not in raw_rent.lower()[:200], "output": raw_rent[:2000]})
+        except Exception as e:
+            service_log.warning("[RENT_SHORT] rent_house 失败: %s", e)
+            return None
+        try:
+            rent_data = json.loads(raw_rent)
+            if "error" in str(rent_data).lower():
+                return None
+        except json.JSONDecodeError:
+            pass
+        result = json.dumps({"message": f"已为您在{cheapest_platform}办理租房，{house_id}。", "houses": [house_id]}, ensure_ascii=False)
+        return (result, tool_results)
+
+    return None
+
+
+# 多轮追加筛选：用 get_house_by_id 过滤，不重新搜索
+_FILTER_KEYWORDS = {
+    "安静": ["hidden_noise_level", "安静"],
+    "电梯": ["elevator", True],
+    "民水民电": ["utilities_type", "民水民电"],
+    "月付": ["tags", "月付"],
+    "押一": ["tags", "押一"],
+    "房东直租": ["tags", "房东直租"],
+    "采光": ["tags", "采光"],
+    "朝南": ["orientation", "朝南"],
+    "南北通透": ["orientation", "南北"],
+}
+
+
+def _get_filter_from_message(msg: str) -> tuple[str, Any] | None:
+    """从消息提取追加筛选条件，返回 (field, expected) 或 None。"""
+    for kw, (field, expected) in _FILTER_KEYWORDS.items():
+        if kw in msg:
+            return (field, expected)
+    return None
+
+
+async def _do_multi_turn_filter(
+    last_house_ids: list[str], filter_spec: tuple[str, Any], user_id: str
+) -> tuple[str, list[dict]] | None:
+    """多轮筛选：对 last_house_ids 逐个 get_house_by_id，按条件过滤。"""
+    field, expected = filter_spec
+    matched: list[str] = []
+    tool_results: list[dict] = []
+    for hid in last_house_ids[:5]:
+        if _is_likely_fake_house_id(hid):
+            continue
+        try:
+            raw = await run_tool("get_house_by_id", {"house_id": hid}, user_id)
+            tool_results.append({"name": "get_house_by_id", "success": "error" not in raw.lower()[:200], "output": raw[:500]})
+        except Exception:
+            continue
+        try:
+            h = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(h, dict):
+            continue
+        if field == "hidden_noise_level":
+            val = h.get("hidden_noise_level") or ""
+            if expected in str(val):
+                matched.append(hid)
+        elif field == "elevator":
+            val = h.get("elevator")
+            if val is True or str(val).lower() == "true":
+                matched.append(hid)
+        elif field == "utilities_type":
+            val = h.get("utilities_type") or ""
+            if expected in str(val):
+                matched.append(hid)
+        elif field == "orientation":
+            val = h.get("orientation") or ""
+            if expected in str(val):
+                matched.append(hid)
+        elif field == "tags":
+            tags = h.get("tags") or []
+            if expected in tags:
+                matched.append(hid)
+    if not matched:
+        msg = "暂无符合该条件的房源，建议调整筛选"
+    else:
+        msg = f"已为您筛选出{len(matched)}套符合条件的房源"
+    return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results)
 
 
 def _try_direct_search(msg: str) -> dict | None:
     """从明确的租房需求中提取参数，直接构建 API 查询参数。"""
-    # 排除：操作类、纯地标无区域（附近/上班/公司 等需 get_houses_nearby）
-    # 放宽：含「站」或「望京」时，若同时有行政区(朝阳/海淀等)，仍可走短路
     if any(kw in msg for kw in ["办理", "预约", "退租", "退掉", "下架"]):
         return None
     has_district = any(d in msg for d in _DISTRICTS)
     if not has_district and any(kw in msg for kw in ["附近", "上班", "公司", "SOHO", "商圈", "商城", "国贸", "百度", "小米"]):
         return None
-    # 2026-03-04 重构：若有明确小区名、大学、地标等，不走短路（交给 nearby/community）
-    # 避免： "我想在望京西园找房" -> 提取 "望京"(朝阳) -> 搜全朝阳 -> 错误
+    
+    # 排除复杂地标/小区查询
     if any(kw in msg for kw in ["小区", "园", "里", "寓", "苑", "舍", "家", "村", "大厦", "中心", "广场", "大学", "学院", "医院", "公园"]):
-        # 简单 heuristic: 常见小区后缀
         return None
     if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看"]):
         return None
@@ -493,16 +642,16 @@ def _try_direct_search(msg: str) -> dict | None:
         raw = bed_match.group(1)
         params["bedrooms"] = _CN_NUM.get(raw, raw)
 
+    def _parse_price(s: str) -> int:
+        s = s.lower()
+        if "k" in s:
+            return int(float(s.replace("k", "")) * 1000)
+        if "千" in s:
+            return int(float(s.replace("千", "")) * 1000)
+        return int(s)
+
     range_match = _PRICE_RANGE_RE.search(msg)
     if range_match:
-        def _parse_price(s: str) -> int:
-            s = s.lower()
-            if "k" in s:
-                return int(float(s.replace("k", "")) * 1000)
-            if "千" in s:
-                return int(float(s.replace("千", "")) * 1000)
-            return int(s)
-        
         p1 = _parse_price(range_match.group(1))
         p2 = _parse_price(range_match.group(2))
         params["min_price"] = min(p1, p2)
@@ -510,13 +659,6 @@ def _try_direct_search(msg: str) -> dict | None:
     else:
         price_match = _PRICE_MAX_RE.search(msg) or _PRICE_MAX_RE2.search(msg)
         if price_match:
-            def _parse_price(s: str) -> int:
-                s = s.lower()
-                if "k" in s:
-                    return int(float(s.replace("k", "")) * 1000)
-                if "千" in s:
-                    return int(float(s.replace("千", "")) * 1000)
-                return int(s)
             params["max_price"] = _parse_price(price_match.group(1))
 
     area_match = _AREA_MIN_RE.search(msg)
@@ -548,35 +690,24 @@ def _try_direct_search(msg: str) -> dict | None:
     elif "合租" in msg or "单间" in msg:
         params["rental_type"] = "合租"
 
-    # 平台兼容：链家/58 数据可能为空，不传 listing_platform 避免误判无房
     for label, platform in _PLATFORMS.items():
         if label in msg:
             if platform in ("链家", "58同城"):
-                break  # 不加入 listing_platform，让 API 返回所有平台数据
+                break
             params["listing_platform"] = platform
             break
-
+            
+    # 排序参数
     if "从低到高" in msg or "从便宜到贵" in msg:
-        params["sort_by"] = "price"
-        params["sort_order"] = "asc"
+        params.update({"sort_by": "price", "sort_order": "asc"})
     elif "从高到低" in msg or "从贵到便宜" in msg:
-        params["sort_by"] = "price"
-        params["sort_order"] = "desc"
+        params.update({"sort_by": "price", "sort_order": "desc"})
     elif "从大到小" in msg:
-        params["sort_by"] = "area"
-        params["sort_order"] = "desc"
+        params.update({"sort_by": "area", "sort_order": "desc"})
     elif "从小到大" in msg:
-        params["sort_by"] = "area"
-        params["sort_order"] = "asc"
-    elif "离地铁" in msg and ("从近到远" in msg or "排" in msg):
-        params["sort_by"] = "subway"
-        params["sort_order"] = "asc"
-    elif "按租金" in msg:
-        params["sort_by"] = "price"
-        params["sort_order"] = "asc" if "低" in msg else "desc"
-    elif "按面积" in msg:
-        params["sort_by"] = "area"
-        params["sort_order"] = "desc" if "大" in msg else "asc"
+        params.update({"sort_by": "area", "sort_order": "asc"})
+    elif "离地铁从近到远" in msg or ("近" in msg and "排" in msg):
+        params.update({"sort_by": "subway", "sort_order": "asc"})
 
     subway_line_match = _SUBWAY_LINE_RE.search(msg)
     if subway_line_match:
@@ -584,6 +715,8 @@ def _try_direct_search(msg: str) -> dict | None:
 
     if not params.get("district"):
         return None
+        
+    # 必须包含至少一个过滤条件
     has_filter = any(params.get(k) for k in (
         "bedrooms", "max_price", "min_price", "rental_type", "decoration",
         "elevator", "max_subway_dist", "commute_to_xierqi_max", "listing_platform",
@@ -595,8 +728,87 @@ def _try_direct_search(msg: str) -> dict | None:
     return params
 
 
+def _try_community_query(msg: str) -> str | None:
+    """识别小区查询，如「建清园南区有在租的吗」→ 建清园(南区)。"""
+    msg = msg.strip()
+    if "在租" not in msg and "有在租" not in msg:
+        return None
+    m = _COMMUNITY_RE.search(msg)
+    if not m:
+        return None
+    community = m.group(1).strip()
+    if len(community) < 2 or any(d in community for d in _DISTRICTS):
+        return None
+    # 建清园南区 → 建清园(南区)，匹配 API 数据格式
+    for suffix in ["南区", "北区", "东区", "西区", "一期", "二期"]:
+        if community.endswith(suffix) and "(" not in community:
+            community = community[: -len(suffix)] + f"({suffix})"
+            break
+    return community
+
+
+def _try_landmark_query(msg: str) -> tuple[str, int] | None:
+    """识别地标附近查房，返回 (地标关键词, max_distance米) 或 None。"""
+    for lm in _LANDMARK_DISTRICT:
+        if lm in msg:
+            dist_m = 1000
+            dm = _LANDMARK_DIST_RE.search(msg)
+            if dm:
+                dist_m = int(dm.group(1))
+            return (lm, dist_m)
+    return None
+
+
+async def _do_community_search(community: str, user_id: str) -> str:
+    """小区查房：get_houses_by_community。"""
+    try:
+        raw = await run_tool("get_houses_by_community", {"community": community}, user_id)
+    except Exception as e:
+        service_log.warning("[COMMUNITY] 查询失败: %s", e)
+        return json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False)
+    items = _extract_items(json.loads(raw)) if raw else []
+    ids = []
+    for item in (items or []):
+        if isinstance(item, dict):
+            hid = item.get("house_id") or item.get("id")
+            if hid:
+                ids.append(str(hid))
+    msg = f"为您找到{len(ids)}套{community}房源" if ids else f"暂未找到{community}在租房源"
+    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+
+
+async def _do_landmark_search(landmark_q: str, max_dist: int, user_id: str) -> str:
+    """地标附近查房：search_landmarks → get_houses_nearby。"""
+    try:
+        raw_search = await run_tool("search_landmarks", {"q": landmark_q}, user_id)
+        data = json.loads(raw_search)
+    except Exception as e:
+        service_log.warning("[LANDMARK] search_landmarks 失败: %s", e)
+        return json.dumps({"message": "地标查询失败，请稍后重试", "houses": []}, ensure_ascii=False)
+    landmarks = data.get("landmarks") or data.get("items") or _extract_items(data) or []
+    if not landmarks or not isinstance(landmarks[0], dict):
+        return json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+    lid = landmarks[0].get("id") or landmarks[0].get("landmark_id") or ""
+    if not lid:
+        return json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+    try:
+        raw_nearby = await run_tool("get_houses_nearby", {"landmark_id": lid, "max_distance": max_dist}, user_id)
+    except Exception as e:
+        service_log.warning("[LANDMARK] get_houses_nearby 失败: %s", e)
+        return json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False)
+    items = _extract_items(json.loads(raw_nearby)) if raw_nearby else []
+    ids = []
+    for item in (items or []):
+        if isinstance(item, dict):
+            hid = item.get("house_id") or item.get("id")
+            if hid:
+                ids.append(str(hid))
+    msg = f"为您找到{len(ids)}套{landmark_q}附近房源" if ids else f"暂未找到{landmark_q}附近在租房源"
+    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+
+
 async def _do_direct_search(params: dict, user_id: str) -> str:
-    """直接调用 get_houses_by_platform 并格式化为标准 JSON 输出。链家/58 无数据时自动回退安居客。"""
+    """直接调用 get_houses_by_platform 并格式化为标准 JSON 输出。"""
     raw_out = await run_tool("get_houses_by_platform", params, user_id)
 
     try:
@@ -607,7 +819,8 @@ async def _do_direct_search(params: dict, user_id: str) -> str:
 
     items = _extract_items(data) or []
     did_platform_fallback = False
-    # 平台兼容：链家/58 返回空时，用安居客重试
+    
+    # 平台回退逻辑
     if not items and params.get("listing_platform") in ("链家", "58同城"):
         retry_params = {k: v for k, v in params.items() if k != "listing_platform"}
         retry_params["listing_platform"] = "安居客"
@@ -622,16 +835,12 @@ async def _do_direct_search(params: dict, user_id: str) -> str:
             params = retry_params
             did_platform_fallback = True
 
-    service_log.info("[DIRECT] API返回结构 keys=%s, 提取到 %d 条 items",
-                     list(data.keys()) if isinstance(data, dict) else type(data).__name__, len(items))
-
     house_ids = []
     for item in items:
         if isinstance(item, dict):
             hid = item.get("house_id") or item.get("id")
             if hid:
                 house_ids.append(str(hid))
-
     house_ids = house_ids[:5]
 
     if house_ids:
@@ -654,21 +863,15 @@ async def chat(req: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=400, detail="message 不能为空")
 
     log_request(session_id, user_message, req.model_ip)
-    user_id = session_id
+    user_id = 'w30020094'
 
-    # 新会话：调用房源数据重置
+    # 新会话初始化
     if not is_initialized(session_id):
-        service_log.info("[INIT] session=%s 新会话，初始化房源数据", session_id)
-        try:
-            await init_houses(user_id)
-        except Exception as e:
-            service_log.error("[INIT] session=%s 初始化失败: %s", session_id, e)
         set_initialized(session_id)
 
     # --- 短路 1：基础对话 ---
     canned = _try_canned_response(user_message)
     if canned:
-        service_log.info("[SHORT] session=%s 基础对话短路, response=%s", session_id, canned)
         append_messages(session_id, {"role": "user", "content": user_message})
         append_messages(session_id, {"role": "assistant", "content": canned})
         log_request_response(session_id, user_message, canned)
@@ -677,69 +880,124 @@ async def chat(req: ChatRequest) -> ChatResponse:
             tool_results=[], timestamp=int(time.time()), duration_ms=0,
         )
 
-    # --- 短路 2：明确结构化查询，直接调 API（仅新会话首轮） ---
+    # --- 短路 2：明确结构化查询（仅新会话首轮）---
     messages_so_far = get_messages(session_id)
     if len(messages_so_far) == 0:
-        search_params = _try_direct_search(user_message)
-        if search_params is not None:
-            service_log.info("[SHORT] session=%s 直接搜索短路, params=%s", session_id, search_params)
+        start_ts = time.time()
+        append_messages(session_id, {"role": "user", "content": user_message})
+        tool_name = ""
+        tool_output = ""
+        # 2a: 小区查询
+        community = _try_community_query(user_message)
+        if community:
+            try:
+                direct_result = await _do_community_search(community, user_id)
+                tool_name = "get_houses_by_community"
+                tool_output = direct_result
+            except Exception as e:
+                service_log.warning("[SHORT] session=%s 小区搜索失败: %s", session_id, e)
+        # 2b: 地标附近查房
+        if not tool_output:
+            landmark_q = _try_landmark_query(user_message)
+            if landmark_q:
+                lm_name, lm_dist = landmark_q
+                try:
+                    direct_result = await _do_landmark_search(lm_name, lm_dist, user_id)
+                    tool_name = "get_houses_nearby"
+                    tool_output = direct_result
+                except Exception as e:
+                    service_log.warning("[SHORT] session=%s 地标搜索失败: %s", session_id, e)
+        # 2c: 区县+条件查房
+        if not tool_output:
+            search_params = _try_direct_search(user_message)
+            if search_params is not None:
+                try:
+                    direct_result = await _do_direct_search(search_params, user_id)
+                    tool_name = "get_houses_by_platform"
+                    tool_output = direct_result
+                except Exception as e:
+                    service_log.warning("[SHORT] session=%s 直接搜索失败: %s", session_id, e)
+        if tool_output:
+            direct_result = _ensure_strict_json_response(tool_output)
+            dur = int((time.time() - start_ts) * 1000)
+            log_response(session_id, "success", dur, direct_result)
+            log_request_response(session_id, user_message, direct_result)
+            append_messages(session_id, {"role": "assistant", "content": direct_result})
+            return ChatResponse(
+                session_id=session_id, response=direct_result, status="success",
+                tool_results=[{"name": tool_name or "search", "success": True, "output": direct_result}],
+                timestamp=int(start_ts), duration_ms=dur,
+            )
+        # 若短路未命中，撤销刚才 append 的 user 消息，让后续流程统一 append
+        msgs = get_messages(session_id)
+        if msgs and msgs[-1].get("role") == "user" and msgs[-1].get("content") == user_message:
+            msgs = list(msgs)
+            msgs.pop()
+            set_messages(session_id, msgs)
+
+    # --- 短路 3：租房/比价（有上一轮候选房源时）---
+    last_house_ids = _extract_last_house_ids(messages_so_far)
+    rent_shortcut = await _do_rent_or_compare_shortcut(last_house_ids, user_message, user_id)
+    if rent_shortcut:
+        result_str, tool_results = rent_shortcut
+        start_ts = time.time()
+        append_messages(session_id, {"role": "user", "content": user_message})
+        append_messages(session_id, {"role": "assistant", "content": result_str})
+        dur = int((time.time() - start_ts) * 1000)
+        log_response(session_id, "success", dur, result_str)
+        log_request_response(session_id, user_message, result_str)
+        return ChatResponse(
+            session_id=session_id, response=result_str, status="success",
+            tool_results=tool_results, timestamp=int(start_ts), duration_ms=dur,
+        )
+
+    # --- 短路 4：多轮追加筛选（get_house_by_id 过滤）---
+    filter_spec = _get_filter_from_message(user_message)
+    if filter_spec and last_house_ids:
+        filter_result = await _do_multi_turn_filter(last_house_ids, filter_spec, user_id)
+        if filter_result:
+            result_str, tool_results = filter_result
             start_ts = time.time()
             append_messages(session_id, {"role": "user", "content": user_message})
-            try:
-                direct_result = await _do_direct_search(search_params, user_id)
-                direct_result = _ensure_strict_json_response(direct_result)
-                dur = int((time.time() - start_ts) * 1000)
-                log_response(session_id, "success", dur, direct_result)
-                log_request_response(session_id, user_message, direct_result)
-                append_messages(session_id, {"role": "assistant", "content": direct_result})
-                return ChatResponse(
-                    session_id=session_id, response=direct_result, status="success",
-                    tool_results=[{"name": "get_houses_by_platform", "success": True, "output": direct_result}],
-                    timestamp=int(start_ts), duration_ms=dur,
-                )
-            except Exception as e:
-                service_log.warning("[SHORT] session=%s 直接搜索失败，回落到模型: %s", session_id, e)
+            append_messages(session_id, {"role": "assistant", "content": result_str})
+            dur = int((time.time() - start_ts) * 1000)
+            log_response(session_id, "success", dur, result_str)
+            log_request_response(session_id, user_message, result_str)
+            return ChatResponse(
+                session_id=session_id, response=result_str, status="success",
+                tool_results=tool_results, timestamp=int(start_ts), duration_ms=dur,
+            )
 
-    # 追加本轮用户消息
     append_messages(session_id, {"role": "user", "content": user_message})
-
-    tools_schema = get_tools_schema()
     messages = get_messages(session_id)
     
-    # 构建模型消息：系统提示 + 需求摘要（多轮时）+ 上一轮候选房源 + 压缩历史
+    # 构建 Prompt
     system_content = SYSTEM_PROMPT
     summary = _extract_requirements_summary(messages)
     if summary and len(messages) >= 2:
         system_content = system_content + f"\n\n[{summary}]"
     last_house_ids = _extract_last_house_ids(messages)
     if last_house_ids and len(messages) >= 4:
-        system_content = system_content + f"\n\n[上一轮候选房源：{', '.join(last_house_ids)}。本轮新增条件请在上述房源中筛选，用 get_house_by_id 查详情后过滤，不得重新全量搜索。]"
-    model_messages: list[dict] = [{"role": "system", "content": system_content}]
+        system_content = system_content + f"\n\n[上一轮候选房源：{', '.join(last_house_ids)}]"
 
-    KEEP_RECENT = 18  # 略增历史窗口，减少长对话截断
+    model_messages: list[dict] = [{"role": "system", "content": system_content}]
+    KEEP_RECENT = 8
     total_msgs = len(messages)
     
     for i, m in enumerate(messages):
+        is_old = i < (total_msgs - KEEP_RECENT)
         role = m.get("role")
         content = m.get("content", "") or ""
-        is_old = i < (total_msgs - KEEP_RECENT)
         
-        if role == "user":
-            model_messages.append({"role": "user", "content": content})
-        elif role == "assistant":
-            msg = {"role": "assistant", "content": content}
-            if m.get("tool_calls"):
-                msg["tool_calls"] = m["tool_calls"]
-            model_messages.append(msg)
-        elif role == "tool":
-            if is_old:
-                model_messages.append(
-                    {"role": "tool", "tool_call_id": m.get("tool_call_id", ""), "content": "History tool output."}
-                )
-            else:
-                model_messages.append(
-                    {"role": "tool", "tool_call_id": m.get("tool_call_id", ""), "content": content}
-                )
+        if role == "tool" and is_old:
+            content = "History tool output."
+            
+        msg = {"role": role, "content": content}
+        if m.get("tool_calls"):
+            msg["tool_calls"] = m["tool_calls"]
+        if m.get("tool_call_id"):
+            msg["tool_call_id"] = m["tool_call_id"]
+        model_messages.append(msg)
 
     tool_results: list[dict] = []
     start_ts = time.time()
@@ -748,22 +1006,21 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     while round_count < MAX_TOOL_ROUNDS:
         round_count += 1
-        service_log.info("[LOOP] session=%s round=%d/%d 开始模型调用", session_id, round_count, MAX_TOOL_ROUNDS)
-        
-        current_tools = tools_schema if round_count <= 5 else None
+        tools_schema = get_tools_schema(round_num=round_count)
+        current_tools = tools_schema if round_count <= MAX_TOOL_ROUNDS else None
         
         response = await chat_completions(req.model_ip, model_messages, tools=current_tools, session_id=session_id)
         content, tool_calls = parse_assistant_message(response)
 
         if not tool_calls:
             response_text = content or ""
-            service_log.info("[LOOP] session=%s round=%d 模型返回文本(无tool_calls), len=%d", session_id, round_count, len(response_text))
-            # 收集本轮及之前轮次工具返回的有效房源 ID
+            # 收集有效ID
             valid_house_ids = set()
             for tr in tool_results:
                 for hid in _extract_house_ids_from_tool_output(tr.get("output", "") or ""):
                     valid_house_ids.add(hid)
-            # 兜底：若 content 为 tool call 形态（模型误输出），尝试执行；严禁将原始 tool call JSON 返回用户
+            
+            # 尝试修复误输出的 tool call 文本
             parsed = _parse_tool_call_content(response_text)
             if parsed:
                 fallback_result = await _try_execute_tool_call_from_content(response_text, user_id)
@@ -773,22 +1030,18 @@ async def chat(req: ChatRequest) -> ChatResponse:
                         for h in fb.get("houses", []):
                             if isinstance(h, str) and h.startswith("HF_"):
                                 valid_house_ids.add(h)
-                    except (json.JSONDecodeError, TypeError):
+                    except Exception:
                         pass
                     response_text = _ensure_strict_json_response(fallback_result, valid_house_ids or None)
                 else:
-                    response_text = json.dumps({"message": "查询暂时失败，请稍后重试或调整条件", "houses": []}, ensure_ascii=False)
-            elif _looks_like_tool_call(response_text):
-                response_text = json.dumps({"message": "查询暂时失败，请稍后重试或调整条件", "houses": []}, ensure_ascii=False)
+                    response_text = json.dumps({"message": "查询失败，请重试", "houses": []}, ensure_ascii=False)
             else:
                 response_text = _ensure_strict_json_response(response_text, valid_house_ids or None)
+                
             append_messages(session_id, {"role": "assistant", "content": response_text})
             break
 
-        # 有 tool_calls：执行并追加 tool 结果
-        tool_names = [((tc.get("function") or {}).get("name", "")) for tc in tool_calls]
-        service_log.info("[LOOP] session=%s round=%d 模型请求工具调用: %s", session_id, round_count, tool_names)
-
+        # 执行 Tool Calls
         assistant_msg = {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
         model_messages.append(assistant_msg)
         append_messages(session_id, assistant_msg)
@@ -803,28 +1056,28 @@ async def chat(req: ChatRequest) -> ChatResponse:
             except json.JSONDecodeError:
                 args = {}
 
-            tool_log.info("[EXEC] session=%s round=%d tool=%s tid=%s args=%s", session_id, round_count, fn, tid, json.dumps(args, ensure_ascii=False)[:500])
+            tool_log.info("[EXEC] session=%s round=%d tool=%s", session_id, round_count, fn)
             t_tool = time.time()
             try:
                 raw_out = await run_tool(fn, args, user_id)
             except Exception as e:
                 raw_out = json.dumps({"error": str(e)})
-                tool_log.error("[EXEC] session=%s tool=%s 异常: %s", session_id, fn, e)
-            tool_dur = int((time.time() - t_tool) * 1000)
             
+            tool_dur = int((time.time() - t_tool) * 1000)
             compressed_out = _compress_tool_output(fn, raw_out)
-            success = "error" not in raw_out.lower()[:200]
-            tool_results.append({"name": fn, "success": success, "output": raw_out[:2000]})
-            tool_log.info("[EXEC] session=%s tool=%s success=%s duration=%dms compressed_len=%d", session_id, fn, success, tool_dur, len(compressed_out))
-
-            model_messages.append({"role": "tool", "tool_call_id": tid, "content": compressed_out})
-            tool_outputs.append({"role": "tool", "tool_call_id": tid, "content": compressed_out})
+            
+            tool_results.append({"name": fn, "success": "error" not in raw_out.lower()[:200], "output": raw_out[:2000]})
+            
+            tool_msg = {"role": "tool", "tool_call_id": tid, "content": compressed_out}
+            model_messages.append(tool_msg)
+            tool_outputs.append(tool_msg)
             
         append_messages(session_id, *tool_outputs)
 
     duration_ms = int((time.time() - start_ts) * 1000)
     log_response(session_id, "success", duration_ms, response_text)
     log_request_response(session_id, user_message, response_text)
+    
     return ChatResponse(
         session_id=session_id, response=response_text, status="success",
         tool_results=tool_results, timestamp=int(start_ts), duration_ms=duration_ms,

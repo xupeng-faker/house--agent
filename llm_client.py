@@ -16,7 +16,7 @@ _model_client: httpx.AsyncClient | None = None
 def _get_model_client() -> httpx.AsyncClient:
     global _model_client
     if _model_client is None or _model_client.is_closed:
-        _model_client = httpx.AsyncClient(timeout=120.0)
+        _model_client = httpx.AsyncClient(timeout=120.0, trust_env=False)
     return _model_client
 
 
