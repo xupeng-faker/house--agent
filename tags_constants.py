@@ -1,6 +1,7 @@
 """
 房源 tag 常量：供代码引用与 prompt 参考。
 包含 98 个权威 tag，按语义分组。
+main.py 中 _FILTER_KEYWORDS / _TAG_EQUIVALENTS / _EXCLUDE_RULES 的 tag 值需与此文件一致。
 """
 
 # 看房方式

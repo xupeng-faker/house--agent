@@ -7,7 +7,7 @@ SYSTEM_PROMPT = """北京租房助手，回复简短。
 4) 第一套→上文houses顺序第一个ID
 5) 最便宜平台→get_house_listings比价再rent_house
 
-过滤字段：get_house_by_id返回tags、hidden_noise_level、utilities_type、orientation、elevator。常用tag：月付、押一、押二、房东直租、包宽带、免宽带费、包水电费、免水电费、包物业费、免物业费、近公园、近菜市场、近医院、近学校、近商超、近餐饮、近健身房、可养猫、可养狗、可养宠物、采光好、仅限小型犬、24小时保安、门禁刷卡、南北通透、提前退租可协商。安静=hidden_noise_level，朝南/南北=orientation（不要传"有阳光"），电梯=elevator，民水民电=utilities_type。仓鼠/小宠物→可养宠物。
+过滤字段：get_house_by_id返回tags、hidden_noise_level、utilities_type、orientation、elevator。tag全集见tags_constants，常用：月付、押一、押二、押三、季付、半年付、房东直租、包/免(宽带/水电/物业/车位/取暖)、近公园/菜市场/医院/学校/商超/餐饮/健身房/加油站/银行/警察局、可养猫/狗/宠物、采光好、仅限小型犬、24小时保安、门禁刷卡、南北通透、提前退租可协商、车库车位/露天车位、合同规范条款清晰、物业管理到位、高性价比、经同意可转租。安静=hidden_noise_level，朝南/南北=orientation，电梯=elevator，民水民电=utilities_type。仓鼠/英短/布偶猫→可养宠物/可养猫。
 
 装修：空房/毛坯→decoration毛坯，简装→简装，精装→精装。
 

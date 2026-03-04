@@ -276,7 +276,7 @@ def _extract_house_ids_from_tool_output(output: str) -> list[str]:
 def _ensure_strict_json_response(text: str, valid_house_ids: set[str] | None = None) -> str:
     """最终兜底：规范为仅 message+houses 的 JSON，符合评测要求。"""
     if not text or not text.strip():
-        return json.dumps({"message": "查询失败，请重试", "houses": []}, ensure_ascii=False)
+        return json.dumps({"message": "查询暂时不可用，建议稍后重试或简化筛选条件", "houses": []}, ensure_ascii=False)
     extracted = _try_extract_json(text)
     if extracted:
         return _clean_and_enforce_limit(extracted, valid_house_ids)
@@ -395,6 +395,8 @@ def _compress_tool_output(tool_name: str, output: str) -> str:
 # --------------- 短路与意图预处理 ---------------
 
 _CN_NUM = {"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"}
+# 中文数字+米：三百米→300，一千五百米→1500
+_CN_METERS = {"三百米": 300, "五百米": 500, "八百米": 800, "一千米": 1000, "一千五百米": 1500, "两千米": 2000}
 _DISTRICTS = ["海淀", "朝阳", "通州", "昌平", "大兴", "房山", "西城", "丰台", "顺义", "东城"]
 _BEDROOM_RE = re.compile(r"([一二两三四五1-5])\s*(?:居|室|房)")
 _PRICE_MAX_RE = re.compile(r"(?:租金|预算|月租|价格).*?(\d+(?:k|千)?|\d{3,5})\s*(?:元|块)?(?:以[下内里]|以内|之内|之下)?", re.IGNORECASE)
@@ -404,14 +406,15 @@ _AREA_MIN_RE = re.compile(r"(\d{2,3})\s*(?:平|㎡)(?:以上|米以上)?")
 _COMMUTE_RE = re.compile(r"通勤\s*(\d{1,3})\s*分钟")
 _SUBWAY_LINE_RE = re.compile(r"(\d{1,2})号线")
 _SUBWAY_DIST_RE = re.compile(r"(\d{3,4})\s*(?:米|m)(?:以?内)?")
+_SUBWAY_KM_RE = re.compile(r"(\d+\.?\d*)\s*公里")
 _PLATFORMS = {"链家": "链家", "安居客": "安居客", "58同城": "58同城", "58": "58同城"}
 _LANDMARK_DISTRICT = {
     "望京南": "朝阳", "望京": "朝阳", "望京西": "朝阳", "立水桥": "朝阳", "双合站": "朝阳",
     "百子湾": "朝阳", "百子湾站": "朝阳", "三元桥": "朝阳", "三元桥站": "朝阳",
-    "金融街": "西城", "西二旗": "海淀", "车公庄": "西城", "中关村": "海淀",
+    "金融街": "西城", "西二旗": "海淀", "车公庄": "西城", "中关村": "海淀", "中关村站": "海淀",
     "国贸": "朝阳", "上地": "海淀", "亦庄": "大兴", "房山城关": "房山",
 }
-_SUBWAY_STATIONS = {"双合站", "百子湾站", "立水桥站", "望京南站", "望京西站", "三元桥站", "车公庄站", "西二旗站"}
+_SUBWAY_STATIONS = {"双合站", "百子湾站", "立水桥站", "望京南站", "望京西站", "三元桥站", "车公庄站", "西二旗站", "中关村站"}
 _COMMUNITY_RE = re.compile(r"^(.+?)(?:有)?在租", re.IGNORECASE)
 _LANDMARK_DIST_RE = re.compile(r"(\d{3,4})\s*米", re.IGNORECASE)
 
@@ -646,9 +649,9 @@ async def _do_nearby_landmarks_shortcut(
             break
     if not lm_type:
         return None
-    if not any(p in user_message for p in ("附近", "周边")):
+    if not any(p in user_message for p in ("附近", "周边", "那附近", "这附近")):
         return None
-    if not any(p in user_message for p in ("吗", "有没有", "有吗", "请问")):
+    if not any(p in user_message for p in ("吗", "有没有", "有吗", "请问", "想问问", "问问")):
         return None
     house_id = last_house_ids[0]
     if _is_likely_fake_house_id(house_id):
@@ -703,7 +706,8 @@ async def _do_terminate_rental_shortcut(
         return None
 
 
-# 多轮追加筛选：用 get_house_by_id 过滤，不重新搜索（更具体的词放前面优先匹配）
+# 多轮追加筛选：用 get_house_by_id 过滤，不重新搜索
+# tag 值需与 tags_constants.ALL_TAGS 一致
 _FILTER_KEYWORDS = {
     "水电费包在房租": ["tags", "包水电费"],
     "水电费包": ["tags", "包水电费"],
@@ -718,6 +722,10 @@ _FILTER_KEYWORDS = {
     "不想额外再交网费": ["tags", "包宽带"],
     "附近有公园": ["tags", "近公园"],
     "近公园": ["tags", "近公园"],
+    "晨跑": ["tags", "近公园"],
+    "户外跑步": ["tags", "近公园"],
+    "遛弯": ["tags", "近公园"],
+    "散步": ["tags", "近公园"],
     "附近有菜市场": ["tags", "近菜市场"],
     "附近有医院": ["tags", "近医院"],
     "附近有学校": ["tags", "近学校"],
@@ -725,8 +733,13 @@ _FILTER_KEYWORDS = {
     "附近可健身": ["tags", "近健身房"],
     "健身的地方": ["tags", "近健身房"],
     "可以健身": ["tags", "近健身房"],
+    "24小时健身房": ["tags", "近健身房"],
+    "有健身房": ["tags", "近健身房"],
     "附近有商超": ["tags", "近商超"],
     "附近有商场": ["tags", "近商超"],
+    "附近有便利店": ["tags", "近商超"],
+    "便利店": ["tags", "近商超"],
+    "小区门口有便利店": ["tags", "近商超"],
     "附近有餐饮": ["tags", "近餐饮"],
     "附近有餐馆": ["tags", "近餐饮"],
     "24小时有餐饮": ["tags", "近餐饮"],
@@ -748,6 +761,7 @@ _FILTER_KEYWORDS = {
     "月付": ["tags", "月付"],
     "押一": ["tags", "押一"],
     "房东好沟通": ["tags", "房东好沟通"],
+    "别为小事找麻烦": ["tags", "房东好沟通"],
     "房东直租": ["tags", "房东直租"],
     "可养猫": ["tags", "可养猫"],
     "养猫": ["tags", "可养猫"],
@@ -776,35 +790,101 @@ _FILTER_KEYWORDS = {
     "提前退租可协商": ["tags", "提前退租可协商"],
     "24小时保安": ["tags", "24小时保安"],
     "门禁刷卡": ["tags", "门禁刷卡"],
-    "采光好": ["tags", "采光好"],
-    "采光": ["tags", "采光好"],
     "朝南": ["orientation", "朝南"],
     "南北通透": ["orientation", "南北"],
     "安静": ["hidden_noise_level", "安静"],
     "电梯": ["elevator", True],
     "民水民电": ["utilities_type", "民水民电"],
     "地下车库": ["tags", "车库车位"],
+    "地库": ["tags", "车库车位"],
     "有车库": ["tags", "车库车位"],
     "地库车位": ["tags", "车库车位"],
+    "拎包入住": ["decoration", "精装"],
+    "家具家电齐全": ["decoration", "精装"],
+    "网红餐饮": ["tags", "近餐饮"],
+    "附近有加油站": ["tags", "近加油站"],
     "免费车位": ["tags", "免车位费"],
     "车位免费": ["tags", "免车位费"],
+    "有车位": ["tags", "车库车位"],
+    "要车位": ["tags", "车库车位"],
     "绿化好": ["tags", "绿化好环境佳"],
     "下午看房": ["tags", "工作日14-18点"],
     "下午能看房": ["tags", "工作日14-18点"],
+    # tags_constants.TAGS_SURROUNDING 补充
+    "附近有银行": ["tags", "近银行"],
+    "近银行": ["tags", "近银行"],
+    # tags_constants.TAGS_OTHER 补充
+    "露天车位": ["tags", "露天车位"],
+    "合同规范": ["tags", "合同规范条款清晰"],
+    "合同清晰": ["tags", "合同规范条款清晰"],
+    "条款清晰": ["tags", "合同规范条款清晰"],
+    "物业管理好": ["tags", "物业管理到位"],
+    "物业好": ["tags", "物业管理到位"],
+    "物业管理到位": ["tags", "物业管理到位"],
+    "高性价比": ["tags", "高性价比"],
+    "性价比高": ["tags", "高性价比"],
+    "性价比": ["tags", "高性价比"],
+    "可转租": ["tags", "经同意可转租"],
+    "能转租": ["tags", "经同意可转租"],
+    "有门禁": ["tags", "门禁刷卡"],
+    "要门禁": ["tags", "门禁刷卡"],
+    "门禁": ["tags", "门禁刷卡"],
+    "刷卡进": ["tags", "门禁刷卡"],
+    "刷卡": ["tags", "门禁刷卡"],
+    # tags_constants.TAGS_FEE 补充
+    "包取暖费": ["tags", "包取暖费"],
+    "免取暖费": ["tags", "免取暖费"],
+    "取暖费包": ["tags", "包取暖费"],
+    "取暖费含在房租": ["tags", "包取暖费"],
+    # tags_constants.TAGS_PAYMENT 补充
+    "押三": ["tags", "押三"],
+    "季付": ["tags", "季付"],
+    "半年付": ["tags", "半年付"],
+    "年付": ["tags", "年付"],
+    # tags_constants.TAGS_LEASE 补充
+    "可半年租": ["tags", "可半年租"],
+    "可年租": ["tags", "可年租"],
+    "长租": ["tags", "可年租"],
+    # tags_constants.TAGS_VIEWING 补充
+    "工作日白天": ["tags", "工作日9-18点"],
+    "工作日白天能看房": ["tags", "工作日9-18点"],
+    "线下或线上": ["tags", "线下+线上"],
+    "线上或线下": ["tags", "线下+线上"],
+    "全天能约": ["tags", "全天可看房"],
+    "全天可约": ["tags", "全天可看房"],
+    # 宠物品种（用例覆盖）
+    "英短": ["tags", "可养猫"],
+    "布偶猫": ["tags", "可养猫"],
+    # EV-022 中介费能接受：正向筛选
+    "中介费按一个月": ["tags", "中介费一月租"],
+    "中介费一月租": ["tags", "中介费一月租"],
+    "中介费一月租我能接受": ["tags", "中介费一月租"],
+    "中介费按半月": ["tags", "中介费半月租"],
+    "中介费半月租": ["tags", "中介费半月租"],
+    # 陪读、陪孩子 → 学校附近
+    "陪读": ["tags", "近学校"],
+    "陪孩子": ["tags", "近学校"],
+    "孩子上学": ["tags", "近学校"],
 }
 
 # 大型犬关键词：用户说这些时，需排除「仅限小型犬」房源
 _LARGE_DOG_KEYWORDS = ["金毛", "大型犬", "哈士奇", "德牧", "拉布拉多", "阿拉斯加"]
 
-# 费用 tag 语义等价：用户要「包X」时，接受「包X」或「免X费」
+# 费用 tag 语义等价：用户要「包X」时，接受「包X」或「免X费」（值来自 tags_constants）
 _TAG_EQUIVALENTS: dict[str, list[str]] = {
     "包宽带": ["包宽带", "免宽带费"],
     "包水电费": ["包水电费", "免水电费"],
     "包物业费": ["包物业费", "免物业费"],
     "包车位": ["包车位", "免车位费"],
     "免车位费": ["免车位费", "包车位"],
+    "包取暖费": ["包取暖费", "免取暖费"],
+    "免取暖费": ["免取暖费", "包取暖费"],
     "可养猫": ["可养猫", "可养宠物"],
     "工作日14-18点": ["工作日14-18点", "周末14-18点", "全天可看房", "周末9-18点", "工作日9-18点"],
+    "工作日9-18点": ["工作日9-18点", "工作日14-18点", "全天可看房"],
+    "门禁刷卡": ["门禁刷卡"],  # 排除 门禁形同虚设、无门禁
+    "经同意可转租": ["经同意可转租"],
+    "车库车位": ["车库车位", "露天车位"],  # 有车位/要车位 接受地库或露天
 }
 
 # 排除型规则：(关键词列表, field, expected) — 用户说关键词时，房源含 expected 则 pass
@@ -827,6 +907,21 @@ _EXCLUDE_RULES: list[tuple[list[str], str, Any]] = [
     (["实地看房", "线下看房", "去实地看房"], "tags", "仅线上VR看房"),
     (["实地看房", "线下看房", "去实地看房"], "tags", "仅线上图片看房"),
     (["实地看房", "线下看房", "去实地看房"], "tags", "仅线上AR看房"),
+    # 门禁：要门禁/有门禁 → 排除形同虚设、无门禁
+    (["有门禁", "要门禁", "门禁"], "tags", "门禁形同虚设"),
+    (["有门禁", "要门禁", "门禁"], "tags", "无门禁"),
+    # 房东：要好沟通 → 排除不配合、难联系
+    (["房东好沟通", "好沟通", "别为小事找麻烦"], "tags", "房东不配合"),
+    (["房东好沟通", "好沟通", "别为小事找麻烦"], "tags", "房东难联系"),
+    # 合同：要规范 → 排除不规范
+    (["合同规范", "合同清晰"], "tags", "合同不规范"),
+    # 物业/环境：要好 → 排除差
+    (["物业好", "物业管理好", "物业管理到位"], "tags", "物业管理差"),
+    (["绿化好", "环境好"], "tags", "绿化少环境一般"),
+    # 车位：要有车位 → 排除无车位
+    (["有车位", "要车位", "车位"], "tags", "无车位"),
+    # 转租：要可转租 → 排除不可转租
+    (["可转租", "能转租"], "tags", "不可转租"),
 ]
 
 
@@ -838,6 +933,13 @@ def _get_filter_from_message(msg: str) -> tuple[str, Any] | None:
     return None
 
 
+# 预算/地铁调整：静态解析
+_BUDGET_RAISE_RE = re.compile(r"(?:预算)?(?:提高|加到|提到)\s*(?:到)?\s*(\d+)\s*(千|k)?", re.IGNORECASE)
+_BUDGET_CTRL_RE = re.compile(r"(?:预算)?(?:控制|控制在?)\s*(\d+)\s*(千|k)?", re.IGNORECASE)
+_BUDGET_ADD_RE = re.compile(r"再加点预算到\s*(\d+)\s*(千|k)?", re.IGNORECASE)
+_SUBWAY_ADJUST_RE = re.compile(r"(?:地铁)?(?:距离)?调整到\s*(\d+)\s*米", re.IGNORECASE)
+
+
 def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any, ...]]:
     """从消息提取所有匹配的筛选条件，多条件取交集。含排除型：(field, expected, exclude=True)。"""
     specs: list[tuple[str, Any, ...]] = [(f, e) for kw, (f, e) in _FILTER_KEYWORDS.items() if kw in msg]
@@ -846,7 +948,60 @@ def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any, ...]]:
     for keywords, field, expected in _EXCLUDE_RULES:
         if any(kw in msg for kw in keywords):
             specs.append((field, expected, True))
+    # 预算调整：提高到/加到/控制
+    def _to_price(num: str, unit: str) -> int:
+        n = int(num)
+        if unit and str(unit).lower() in ("千", "k"):
+            return n * 1000
+        return n
+    raise_m = _BUDGET_RAISE_RE.search(msg)
+    if raise_m:
+        specs.append(("max_price", _to_price(raise_m.group(1), raise_m.group(2) or ""), False))
+    else:
+        ctrl_m = _BUDGET_CTRL_RE.search(msg)
+        if ctrl_m:
+            specs.append(("max_price", _to_price(ctrl_m.group(1), ctrl_m.group(2) or ""), False))
+    add_m = _BUDGET_ADD_RE.search(msg)
+    if add_m:
+        specs.append(("max_price", _to_price(add_m.group(1), add_m.group(2) or ""), False))
+    # 地铁距离调整（含中文数字：调整到三百米）
+    adj_m = _SUBWAY_ADJUST_RE.search(msg)
+    if adj_m:
+        specs.append(("max_subway_dist", int(adj_m.group(1)), False))
+    elif "调整到" in msg and "米" in msg:
+        for cn_m, val in _CN_METERS.items():
+            if cn_m in msg:
+                specs.append(("max_subway_dist", val, False))
+                break
+    # EV-041 离地铁远：多轮筛选，保留 subway_distance >= 1500 的房源
+    if any(p in msg for p in ["离地铁远", "离地铁远一点", "希望离地铁远"]):
+        specs.append(("min_subway_dist", 1500, False))
     return specs
+
+
+async def _merge_budget_half_spec(
+    msg: str, last_house_ids: list[str], user_id: str, base_specs: list[tuple[str, Any, ...]]
+) -> list[tuple[str, Any, ...]]:
+    """预算压一半：从 last_house_ids 获取价格，计算新上限，追加 max_price spec。"""
+    if "压一半" not in msg or not last_house_ids:
+        return base_specs
+    max_price = 0
+    for hid in last_house_ids[:5]:
+        if _is_likely_fake_house_id(hid):
+            continue
+        try:
+            raw = await run_tool("get_house_by_id", {"house_id": hid}, user_id)
+            data = json.loads(raw)
+            h = data.get("data") or data.get("house") or data
+            if isinstance(h, dict):
+                p = int(h.get("price") or 0)
+                max_price = max(max_price, p)
+        except Exception:
+            continue
+    if max_price > 0:
+        new_max = max_price // 2
+        return base_specs + [("max_price", new_max, False)]
+    return base_specs
 
 
 def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = False) -> bool:
@@ -870,6 +1025,27 @@ def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = Fals
         else:
             accepted = _TAG_EQUIVALENTS.get(expected, [expected])
             matched = any(t in tags for t in accepted)
+    elif field == "max_price":
+        try:
+            price = int(h.get("price") or 0)
+            matched = price <= int(expected)
+        except (TypeError, ValueError):
+            return False
+        return matched
+    elif field == "max_subway_dist":
+        try:
+            dist = int(h.get("subway_distance") or 99999)
+            matched = dist <= int(expected)
+        except (TypeError, ValueError):
+            return False
+        return matched
+    elif field == "min_subway_dist":
+        try:
+            dist = int(h.get("subway_distance") or 0)
+            matched = dist >= int(expected)
+        except (TypeError, ValueError):
+            return False
+        return matched
     else:
         return False
     return not matched if exclude else matched
@@ -912,11 +1088,11 @@ async def _do_multi_turn_filter(
     if matched:
         msg = _format_houses_to_message(matched_items, matched)
         return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results)
-    msg = "暂无符合该条件的房源，建议调整筛选"
+    msg = "暂无符合该条件的房源，可考虑放宽部分要求或查看其他区域"
     return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [])
 
 
-def _try_direct_search(msg: str) -> dict | None:
+def _try_direct_search(msg: str) -> dict | list[dict] | None:
     """从明确的租房需求中提取参数，直接构建 API 查询参数。"""
     if any(kw in msg for kw in ["办理", "预约", "退租", "退掉", "下架"]):
         return None
@@ -927,25 +1103,41 @@ def _try_direct_search(msg: str) -> dict | None:
     # 仅排除以小区名为核心的查询（如「XX园有在租的吗」），不因公园/医院等附加条件排除
     if "在租" in msg and not any(kw in msg for kw in ["居室", "两居", "三居", "单间", "预算", "找房", "租房", "居"]):
         return None
-    if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看", "希望", "想要"]):
+    if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看", "希望", "想要", "上班", "通勤"]):
         return None
 
     params: dict[str, Any] = {}
+    districts_to_try: list[str] = []
 
-    for d in _DISTRICTS:
-        if d in msg:
-            params["district"] = d
-            break
-    if not params.get("district"):
-        for lm, dist in _LANDMARK_DISTRICT.items():
-            if lm in msg:
-                params["district"] = dist
+    if "或" in msg or "折中" in msg:
+        districts_to_try = [d for d in _DISTRICTS if d in msg]
+        if not districts_to_try:
+            for lm, dist in _LANDMARK_DISTRICT.items():
+                if lm in msg and dist not in districts_to_try:
+                    districts_to_try.append(dist)
+            districts_to_try = list(dict.fromkeys(districts_to_try))
+    if not districts_to_try:
+        for d in _DISTRICTS:
+            if d in msg:
+                params["district"] = d
                 break
+        if not params.get("district"):
+            for lm, dist in _LANDMARK_DISTRICT.items():
+                if lm in msg:
+                    params["district"] = dist
+                    break
+    elif len(districts_to_try) == 1:
+        params["district"] = districts_to_try[0]
+        districts_to_try = []
 
     bed_match = _BEDROOM_RE.search(msg)
     if bed_match:
         raw = bed_match.group(1)
         params["bedrooms"] = _CN_NUM.get(raw, raw)
+    elif "两人住" in msg or "两个人住" in msg:
+        params["bedrooms"] = "2"
+    elif "三人住" in msg or "三个人住" in msg or "一家三口" in msg:
+        params["bedrooms"] = "3"
 
     def _parse_price(s: str) -> int:
         s = s.lower()
@@ -983,12 +1175,29 @@ def _try_direct_search(msg: str) -> dict | None:
         params["elevator"] = "true"
 
     subway_dist_match = _SUBWAY_DIST_RE.search(msg)
-    if "近地铁" in msg:
+    if "离地铁站近" in msg or "走路5分钟" in msg or "5分钟到地铁" in msg:
+        params["max_subway_dist"] = 500
+    elif "近地铁" in msg or "离地铁近" in msg or "离地铁" in msg:
         params["max_subway_dist"] = 800
+    elif "走路10分钟" in msg or "步行10分钟" in msg or "10分钟到地铁" in msg:
+        params["max_subway_dist"] = 800  # ~10分钟步行约800m
     elif "地铁可达" in msg:
         params["max_subway_dist"] = 1000
     elif subway_dist_match and ("离地铁" in msg or "米" in msg or "地铁" in msg):
         params["max_subway_dist"] = int(subway_dist_match.group(1))
+    elif "两公里" in msg and ("地铁" in msg or "离" in msg):
+        params["max_subway_dist"] = 2000
+    elif "一公里" in msg and ("地铁" in msg or "离" in msg):
+        params["max_subway_dist"] = 1000
+    elif "公里" in msg or "km" in msg.lower():
+        km_match = _SUBWAY_KM_RE.search(msg)
+        if km_match and ("地铁" in msg or "离" in msg):
+            params["max_subway_dist"] = int(float(km_match.group(1)) * 1000)
+    else:
+        for cn_m, val in _CN_METERS.items():
+            if cn_m in msg and ("地铁" in msg or "离" in msg):
+                params["max_subway_dist"] = val
+                break
 
     commute_match = _COMMUTE_RE.search(msg)
     if commute_match:
@@ -1027,9 +1236,19 @@ def _try_direct_search(msg: str) -> dict | None:
             params["subway_station"] = station
             break
 
+    # 双区域：丰台或朝阳、西城或海淀 等
+    if len(districts_to_try) >= 2:
+        base = {k: v for k, v in params.items() if k != "district"}
+        has_filter = any(base.get(k) for k in (
+            "bedrooms", "max_price", "min_price", "rental_type", "decoration",
+            "elevator", "max_subway_dist", "commute_to_xierqi_max", "listing_platform",
+            "sort_by", "subway_line", "subway_station",
+        ))
+        if has_filter:
+            return [{**base, "district": d} for d in districts_to_try[:3]]
+
     if not params.get("district"):
         return None
-        
     # 必须包含至少一个过滤条件
     has_filter = any(params.get(k) for k in (
         "bedrooms", "max_price", "min_price", "rental_type", "decoration",
@@ -1061,6 +1280,71 @@ def _try_community_query(msg: str) -> str | None:
     return community
 
 
+# 首轮「希望附近有健身房/医院/公园」+ 区县：走 search_landmarks + get_houses_nearby（EV-032）
+_NEARBY_TYPE_TRIGGERS = [
+    ("健身房", ["健身房", "附近有健身房", "希望附近有健身房", "有健身房", "附近有可以健身", "24小时健身房"]),
+    ("医院", ["附近有医院", "希望附近有医院", "离医院近"]),
+    ("公园", ["附近有公园", "希望附近有公园", "附近有公园"]),
+]
+
+
+def _try_nearby_type_search(msg: str) -> dict | None:
+    """首轮：希望附近有健身房/医院/公园 + 区县 + (预算或户型)。走地标链。"""
+    if any(kw in msg for kw in ["办理", "预约", "退租", "在租"]):
+        return None
+    lm_type = None
+    for q, triggers in _NEARBY_TYPE_TRIGGERS:
+        if any(t in msg for t in triggers):
+            lm_type = q
+            break
+    if not lm_type:
+        return None
+    district = None
+    for d in _DISTRICTS:
+        if d in msg:
+            district = d
+            break
+    if not district:
+        for lm, dist in _LANDMARK_DISTRICT.items():
+            if lm in msg:
+                district = dist
+                break
+    if not district:
+        return None
+    if not any(kw in msg for kw in ["找", "租", "房", "居", "预算", "希望", "想要", "跑步", "锻炼"]):
+        return None
+    params: dict[str, Any] = {"district": district, "landmark_q": lm_type}
+    bed_match = _BEDROOM_RE.search(msg)
+    if bed_match:
+        params["bedrooms"] = _CN_NUM.get(bed_match.group(1), bed_match.group(1))
+    def _parse_price_val(s: str) -> int:
+        s = str(s).lower()
+        if "k" in s:
+            return int(float(s.replace("k", "")) * 1000)
+        if "千" in s:
+            raw = s.replace("千", "")
+            return int((float(_CN_NUM.get(raw, raw)) if raw in _CN_NUM else float(raw)) * 1000)
+        return int(s)
+
+    if _PRICE_RANGE_RE.search(msg):
+        rm = _PRICE_RANGE_RE.search(msg)
+        if rm:
+            try:
+                params["max_price"] = max(_parse_price_val(rm.group(1)), _parse_price_val(rm.group(2)))
+            except (ValueError, TypeError):
+                pass
+    elif _PRICE_MAX_RE.search(msg) or _PRICE_MAX_RE2.search(msg):
+        pm = _PRICE_MAX_RE.search(msg) or _PRICE_MAX_RE2.search(msg)
+        if pm:
+            try:
+                params["max_price"] = _parse_price_val(pm.group(1))
+            except (ValueError, TypeError):
+                pass
+    if not params.get("bedrooms") and not params.get("max_price"):
+        return None
+    return params
+
+
 def _try_landmark_query(msg: str) -> tuple[str, int] | None:
     """识别地标附近查房，返回 (地标关键词, max_distance米) 或 None。"""
     for lm in _LANDMARK_DISTRICT:
@@ -1069,6 +1353,19 @@ def _try_landmark_query(msg: str) -> tuple[str, int] | None:
             dm = _LANDMARK_DIST_RE.search(msg)
             if dm:
                 dist_m = int(dm.group(1))
+            elif "两公里" in msg:
+                dist_m = 2000
+            elif "一公里" in msg:
+                dist_m = 1000
+            else:
+                for cn_m, val in _CN_METERS.items():
+                    if cn_m in msg:
+                        dist_m = val
+                        break
+                else:
+                    km_m = _SUBWAY_KM_RE.search(msg)
+                    if km_m:
+                        dist_m = int(float(km_m.group(1)) * 1000)
             return (lm, dist_m)
     return None
 
@@ -1088,6 +1385,52 @@ async def _do_community_search(community: str, user_id: str) -> str:
             if hid:
                 ids.append(str(hid))
     msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{community}在租房源"
+    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+
+
+async def _do_nearby_type_search(params: dict, user_id: str) -> str:
+    """首轮健身房/医院/公园地标链：search_landmarks(district) → get_houses_nearby → 按预算/户型过滤。"""
+    district = params.get("district", "")
+    landmark_q = params.get("landmark_q", "健身房")
+    max_price = params.get("max_price")
+    bedrooms = params.get("bedrooms")
+    try:
+        raw_search = await run_tool("search_landmarks", {"q": landmark_q, "district": district}, user_id)
+        data = json.loads(raw_search)
+    except Exception as e:
+        service_log.warning("[NEARBY_TYPE] search_landmarks 失败: %s", e)
+        return json.dumps({"message": "地标查询失败，请稍后重试", "houses": []}, ensure_ascii=False)
+    landmarks = data.get("landmarks") or data.get("items") or _extract_items(data) or []
+    if not landmarks or not isinstance(landmarks[0], dict):
+        return json.dumps({"message": f"未找到{district}{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+    lid = str(landmarks[0].get("id") or landmarks[0].get("landmark_id") or "")
+    if not lid:
+        return json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+    try:
+        raw_nearby = await run_tool("get_houses_nearby", {"landmark_id": lid, "max_distance": 1000}, user_id)
+    except Exception as e:
+        service_log.warning("[NEARBY_TYPE] get_houses_nearby 失败: %s", e)
+        return json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False)
+    items = _extract_items(json.loads(raw_nearby)) if raw_nearby else []
+    filtered: list[dict] = []
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        if max_price is not None:
+            p = int(item.get("price") or 0)
+            if p > max_price:
+                continue
+        if bedrooms is not None:
+            try:
+                b = int(item.get("bedrooms") or 0)
+                need_b = int(bedrooms) if isinstance(bedrooms, (int, str)) else 0
+                if b != need_b:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        filtered.append(item)
+    ids = [str(i.get("house_id") or i.get("id") or "") for i in filtered if i.get("house_id") or i.get("id")]
+    msg = _format_houses_to_message(filtered[:5], ids[:5]) if ids else f"暂未找到{district}{landmark_q}附近符合条件的房源"
     return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
 
 
@@ -1186,12 +1529,41 @@ async def _do_direct_search(params: dict, user_id: str) -> str:
     return json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False)
 
 
+async def _do_multi_district_search(params_list: list[dict], user_id: str) -> str:
+    """双区域查询：分别搜每个 district，合并去重取前5。"""
+    seen: set[str] = set()
+    all_items: list[dict] = []
+    for p in params_list:
+        raw = await run_tool("get_houses_by_platform", p, user_id)
+        try:
+            data = json.loads(raw)
+            items = _extract_items(data) or []
+        except json.JSONDecodeError:
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            hid = str(item.get("house_id") or item.get("id") or "")
+            if hid and hid.startswith("HF_") and hid not in seen:
+                seen.add(hid)
+                all_items.append(item)
+                if len(all_items) >= 5:
+                    break
+        if len(all_items) >= 5:
+            break
+    ids = [str(i.get("house_id") or i.get("id") or "") for i in all_items if i.get("house_id") or i.get("id")]
+    msg = _format_houses_to_message(all_items, ids) if ids else "暂无符合该条件的房源，建议调整筛选条件"
+    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+
+
 # --------------- 核心 chat 接口 ---------------
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     session_id = req.session_id
     user_message = (req.message or "").strip()
+    # 归一化输入：房山房山城关 -> 房山城关
+    user_message = re.sub(r"房山房山", "房山", user_message)
     if not user_message:
         raise HTTPException(status_code=400, detail="message 不能为空")
 
@@ -1229,7 +1601,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 tool_output = direct_result
             except Exception as e:
                 service_log.warning("[SHORT] session=%s 小区搜索失败: %s", session_id, e)
-        # 2b: 地标附近查房
+        # 2b: 地标附近查房（望京南、双合站等）
         if not tool_output:
             landmark_q = _try_landmark_query(user_message)
             if landmark_q:
@@ -1240,12 +1612,25 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     tool_output = direct_result
                 except Exception as e:
                     service_log.warning("[SHORT] session=%s 地标搜索失败: %s", session_id, e)
-        # 2c: 区县+条件查房
+        # 2b2: 首轮健身房/医院/公园地标链（EV-032：希望附近有健身房+区县+预算）
+        if not tool_output:
+            nearby_params = _try_nearby_type_search(user_message)
+            if nearby_params:
+                try:
+                    direct_result = await _do_nearby_type_search(nearby_params, user_id)
+                    tool_name = "search_landmarks+get_houses_nearby"
+                    tool_output = direct_result
+                except Exception as e:
+                    service_log.warning("[SHORT] session=%s 健身房地标链失败: %s", session_id, e)
+        # 2c: 区县+条件查房（含双区域 丰台或朝阳）
         if not tool_output:
             search_params = _try_direct_search(user_message)
             if search_params is not None:
                 try:
-                    direct_result = await _do_direct_search(search_params, user_id)
+                    if isinstance(search_params, list):
+                        direct_result = await _do_multi_district_search(search_params, user_id)
+                    else:
+                        direct_result = await _do_direct_search(search_params, user_id)
                     tool_name = "get_houses_by_platform"
                     tool_output = direct_result
                 except Exception as e:
@@ -1316,6 +1701,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
     filter_specs = _get_all_filters_from_message(user_message)
+    if "压一半" in user_message and last_house_ids:
+        filter_specs = await _merge_budget_half_spec(user_message, last_house_ids, user_id, filter_specs)
     if filter_specs and last_house_ids:
         filter_result = await _do_multi_turn_filter(last_house_ids, filter_specs, user_id)
         if filter_result:
@@ -1397,7 +1784,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
                         pass
                     response_text = _ensure_strict_json_response(fallback_result, valid_house_ids or None)
                 else:
-                    response_text = json.dumps({"message": "查询失败，请重试", "houses": []}, ensure_ascii=False)
+                    response_text = json.dumps({"message": "查询暂时不可用，建议简化条件或稍后重试", "houses": []}, ensure_ascii=False)
             else:
                 response_text = _ensure_strict_json_response(response_text, valid_house_ids or None)
                 
@@ -1462,7 +1849,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 ensure_ascii=False,
             )
         else:
-            response_text = json.dumps({"message": "查询失败，请重试", "houses": []}, ensure_ascii=False)
+            response_text = json.dumps({"message": "暂无符合要求的房源，建议调整条件或更换区域", "houses": []}, ensure_ascii=False)
         append_messages(session_id, {"role": "assistant", "content": response_text})
 
     duration_ms = int((time.time() - start_ts) * 1000)

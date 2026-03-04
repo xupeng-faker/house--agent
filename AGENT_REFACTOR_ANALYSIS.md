@@ -99,9 +99,8 @@
 
 ## 四、实现清单
 
-- [ ] `_format_house_detail_row(item: dict) -> str`：单条房源格式化为 `"小区 | 价格 | 装修 | 地铁 | 地标 | 类型"`。
-- [ ] 在 `_ensure_strict_json_response` 或最终输出前，若有 `tool_results` 含完整 items，用其生成 `message` 文本。
-- [ ] 对链家/58 无数据分支，确认直接搜索和 LLM 工具调用两条路径都会回退。
-- [ ] 补充 `_FILTER_KEYWORDS`：仓鼠、采光好、地下车库、24小时餐饮、健身房等。
-- [ ] 在 `_try_direct_search` 中：`有阳光` → 不传 orientation，或映射为 `采光好` 的 tag 过滤（需 get_house_by_id）。
-- [ ] 更新 `prompts.py`：强调多轮过滤规则与 orientation 合法值。
+- [x] `_format_house_detail_row` / `_format_houses_to_message`：单条房源格式化为 `"小区 | 价格 | 装修 | 地铁 | 地标 | 类型"`。
+- [x] 对链家/58 无数据分支，LLM 工具调用路径自动回退安居客。
+- [x] 补充 `_FILTER_KEYWORDS`：仓鼠、采光好、有阳光、地下车库、24小时餐饮、健身房等。
+- [x] 更新 `prompts.py`：强调多轮过滤规则与 orientation 合法值。
+- [x] 扩展 `_try_direct_search`：离地铁站近→500m，上班/通勤触发租房意图，兜底文案优化。
