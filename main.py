@@ -701,6 +701,8 @@ _FILTER_KEYWORDS = {
     "房东好沟通": ["tags", "房东好沟通"],
     "房东直租": ["tags", "房东直租"],
     "可养猫": ["tags", "可养猫"],
+    "养猫": ["tags", "可养猫"],
+    "允许养猫": ["tags", "可养猫"],
     "可养狗": ["tags", "可养狗"],
     "可养宠物": ["tags", "可养宠物"],
     "养狗": ["tags", "可养狗"],
@@ -721,14 +723,26 @@ _FILTER_KEYWORDS = {
     "安静": ["hidden_noise_level", "安静"],
     "电梯": ["elevator", True],
     "民水民电": ["utilities_type", "民水民电"],
+    "地下车库": ["tags", "车库车位"],
+    "有车库": ["tags", "车库车位"],
 }
 
 # 大型犬关键词：用户说这些时，需排除「仅限小型犬」房源
 _LARGE_DOG_KEYWORDS = ["金毛", "大型犬", "哈士奇", "德牧", "拉布拉多", "阿拉斯加"]
 
+# 费用 tag 语义等价：用户要「包X」时，接受「包X」或「免X费」
+_TAG_EQUIVALENTS: dict[str, list[str]] = {
+    "包宽带": ["包宽带", "免宽带费"],
+    "包水电费": ["包水电费", "免水电费"],
+    "包物业费": ["包物业费", "免物业费"],
+    "包车位": ["包车位", "免车位费"],
+    "可养猫": ["可养猫", "可养宠物"],
+}
+
 # 排除型规则：(关键词列表, field, expected) — 用户说关键词时，房源含 expected 则 pass
 _EXCLUDE_RULES: list[tuple[list[str], str, Any]] = [
     (["不额外收宠物押金", "不要宠物押金", "免宠物押金"], "tags", "可养宠物需宠物押金"),
+    (["养猫", "想养猫", "养只猫", "允许养猫"], "tags", "不可养宠物"),
     (["免中介费", "不想交中介费", "不交中介费", "省中介费"], "tags", "收中介费"),
     (["安静", "隔音", "睡眠浅", "怕吵", "不能吵"], "hidden_noise_level", "吵闹"),
     (["线上VR看房", "线上看房", "不用跑现场", "VR看房"], "tags", "仅线下看房"),
@@ -777,7 +791,11 @@ def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = Fals
         matched = expected in str(val)
     elif field == "tags":
         tags = h.get("tags") or []
-        matched = expected in tags
+        if exclude:
+            matched = expected in tags
+        else:
+            accepted = _TAG_EQUIVALENTS.get(expected, [expected])
+            matched = any(t in tags for t in accepted)
     else:
         return False
     return not matched if exclude else matched
