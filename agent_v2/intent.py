@@ -376,10 +376,15 @@ def extract_search_params(msg: str) -> dict[str, Any]:
                 params["district"] = all_found[-1]
         elif all_found:
             params["district"] = all_found[0]
-    if not params.get("district"):
-        for lm, (dist, _) in LANDMARK_KEYWORDS.items():
+    # District vs area: use district for 行政区, area for 商圈 (西二旗/望京等)
+    if not params.get("district") or not params.get("area"):
+        for lm, (dist, area_name) in LANDMARK_KEYWORDS.items():
             if lm in msg:
-                params["district"] = dist
+                if not params.get("district"):
+                    params["district"] = dist
+                # Use area for 商圈 when doing platform search (not landmark-nearby flow)
+                if not params.get("area") and area_name:
+                    params["area"] = area_name
                 break
 
     # Bedrooms

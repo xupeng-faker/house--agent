@@ -10,6 +10,45 @@ from logger import tool_log
 
 _client: httpx.AsyncClient | None = None
 
+# Params supported by get_houses_by_platform (per API spec)
+_PLATFORM_PARAMS = frozenset({
+    "district", "area", "min_price", "max_price", "bedrooms", "rental_type",
+    "decoration", "orientation", "elevator", "min_area", "max_area",
+    "property_type", "subway_line", "max_subway_dist", "subway_station",
+    "utilities_type", "available_from_before", "commute_to_xierqi_max",
+    "sort_by", "sort_order", "page", "page_size", "listing_platform",
+})
+
+# Alias mappings for LLM-style param names
+_PARAM_ALIASES = {
+    "region": "district",
+    "house_type": "bedrooms",
+    "lease_type": "rental_type",
+}
+
+
+def _sanitize_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize query params: convert bool to str, apply aliases, filter unsupported."""
+    out: dict[str, Any] = {}
+    for k, v in params.items():
+        if v is None:
+            continue
+        key = _PARAM_ALIASES.get(k, k)
+        if key not in _PLATFORM_PARAMS and key not in ("q", "category", "community", "type", "landmark_id", "max_distance", "name", "id"):
+            continue
+        if isinstance(v, bool):
+            out[key] = "true" if v else "false"
+        elif isinstance(v, (str, int, float)):
+            if key == "bedrooms" and isinstance(v, str) and "两" in v:
+                out[key] = "2"
+            elif key == "bedrooms" and isinstance(v, str) and "一" in v and "两" not in v:
+                out[key] = "1"
+            else:
+                out[key] = v
+        else:
+            out[key] = str(v)
+    return out
+
 
 def _get_client() -> httpx.AsyncClient:
     global _client
@@ -59,18 +98,33 @@ async def run_tool(name: str, args: dict[str, Any], user_id: str) -> str:
         return json.dumps({"error": str(exc)})
 
 
+def _to_query_safe(params: dict[str, Any]) -> dict[str, Any]:
+    """Convert params to query-safe types (str/int/float only)."""
+    out: dict[str, Any] = {}
+    for k, v in params.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            out[k] = "true" if v else "false"
+        elif isinstance(v, (str, int, float)):
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
+
+
 async def _dispatch(name: str, args: dict[str, Any], uid: str) -> str:
     base = FAKE_APP_BASE_URL.rstrip("/")
     clean = {k: v for k, v in args.items() if v is not None}
 
     if name == "get_landmarks":
-        return await _get(f"{base}/api/landmarks", clean, uid, need_uid=False)
+        return await _get(f"{base}/api/landmarks", _to_query_safe(clean), uid, need_uid=False)
 
     if name == "get_landmark_by_name":
         return await _get(f"{base}/api/landmarks/name/{clean.get('name', '')}", None, uid, need_uid=False)
 
     if name == "search_landmarks":
-        return await _get(f"{base}/api/landmarks/search", clean, uid, need_uid=False)
+        return await _get(f"{base}/api/landmarks/search", _to_query_safe(clean), uid, need_uid=False)
 
     if name == "get_landmark_by_id":
         return await _get(f"{base}/api/landmarks/{clean.get('id', '')}", None, uid, need_uid=False)
@@ -82,16 +136,30 @@ async def _dispatch(name: str, args: dict[str, Any], uid: str) -> str:
         return await _get(f"{base}/api/houses/listings/{clean.get('house_id', '')}", None, uid)
 
     if name == "get_houses_by_community":
-        return await _get(f"{base}/api/houses/by_community", clean, uid)
+        return await _get(f"{base}/api/houses/by_community", _to_query_safe(clean), uid)
 
     if name == "get_houses_by_platform":
-        return await _get(f"{base}/api/houses/by_platform", clean, uid)
+        sanitized = _sanitize_params(clean)
+        return await _get(f"{base}/api/houses/by_platform", _to_query_safe(sanitized), uid)
 
     if name == "get_houses_nearby":
-        return await _get(f"{base}/api/houses/nearby", clean, uid)
+        return await _get(f"{base}/api/houses/nearby", _to_query_safe(clean), uid)
 
     if name == "get_nearby_landmarks":
-        return await _get(f"{base}/api/houses/nearby_landmarks", clean, uid)
+        comm = clean.get("community", "")
+        # Resolve house_id (HF_xxx) to community name before calling API
+        if comm and str(comm).startswith("HF_"):
+            try:
+                raw_h = await _get(f"{base}/api/houses/{comm}", None, uid)
+                data = json.loads(raw_h)
+                h = data.get("data") or data.get("house") or data
+                if isinstance(h, dict):
+                    resolved = h.get("community") or ""
+                    if resolved:
+                        clean = {**clean, "community": resolved}
+            except Exception:
+                pass
+        return await _get(f"{base}/api/houses/nearby_landmarks", _to_query_safe(clean), uid)
 
     if name == "rent_house":
         hid = clean.get("house_id", "")

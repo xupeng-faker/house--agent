@@ -465,6 +465,14 @@ async def _llm_fallback(
         if not tool_calls:
             response_text = content or ""
             response_text = _normalize_response(response_text, valid_ids or None)
+
+            # Response pipeline: when we have candidates or valid_ids, MUST return JSON with houses
+            house_ids_to_use = valid_ids or set(sess.candidates) if sess.candidates else set()
+            if house_ids_to_use and not _is_valid_house_json(response_text):
+                ids_list = list(house_ids_to_use)[:5]
+                msg = "根据您的需求为您筛选出以下房源" if sess.candidates else "为您找到以下房源"
+                response_text = _resp_json(msg, ids_list)
+
             sess.append_msg({"role": "assistant", "content": response_text})
 
             # Update candidates from response
@@ -510,10 +518,11 @@ async def _llm_fallback(
 
         sess.append_msg(*tool_outputs)
 
-    # Fallback if loop exhausted
+    # Fallback if loop exhausted: always return JSON with houses when we have any
     if not response_text:
-        if valid_ids:
-            ids_list = list(valid_ids)[:5]
+        house_ids = valid_ids or set(sess.candidates) if sess.candidates else set()
+        if house_ids:
+            ids_list = list(house_ids)[:5]
             response_text = _resp_json(f"为您找到{len(ids_list)}套符合条件的房源", ids_list)
         else:
             response_text = _resp_json("查询失败，请重试", [])
