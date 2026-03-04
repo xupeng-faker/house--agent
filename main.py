@@ -294,6 +294,43 @@ def _fallback_extract_houses(text: str) -> str | None:
     return None
 
 
+def _format_house_row(item: dict) -> str:
+    """将单条房源格式化为：小区 | 价格元/月 | 装修 | 地铁Xm | 地标 | 租住类型"""
+    community = str(item.get("community") or item.get("community_name") or "")
+    if not community:
+        community = str(item.get("house_id") or item.get("id") or "未知")
+    price = item.get("price") or 0
+    decoration = str(item.get("decoration") or "")
+    sub_dist = item.get("subway_distance")
+    sub_str = f"地铁{sub_dist}m" if sub_dist is not None and sub_dist != "" else "地铁-"
+    station = str(item.get("subway_station") or item.get("subway") or "")[:10]
+    rental_type = str(item.get("rental_type") or "")
+    price_str = f"{price}元/月" if price else "-"
+    return f"{community} | {price_str} | {decoration} | {sub_str} | {station} | {rental_type}"
+
+
+def _format_houses_to_message(items: list[dict], house_ids: list[str] | None = None, max_n: int = 5) -> str:
+    """将房源列表格式化为可读的 message 文本。"""
+    if not items:
+        return "暂无符合条件的房源，建议调整筛选条件"
+    # 若指定了 house_ids，按该顺序排列
+    id_to_item = {(item.get("house_id") or item.get("id") or ""): item for item in items if isinstance(item, dict)}
+    ordered: list[dict] = []
+    if house_ids:
+        for hid in house_ids[:max_n]:
+            if hid in id_to_item:
+                ordered.append(id_to_item[hid])
+        for item in items:
+            if isinstance(item, dict):
+                hid = str(item.get("house_id") or item.get("id") or "")
+                if hid not in house_ids[:max_n] and len(ordered) < max_n:
+                    ordered.append(item)
+    else:
+        ordered = [item for item in items if isinstance(item, dict)][:max_n]
+    lines = [f"{i+1}. {_format_house_row(item)}" for i, item in enumerate(ordered[:max_n])]
+    return "为您找到{}套符合条件的房源：\n{}".format(len(ordered), "\n".join(lines))
+
+
 def _extract_items(data: Any) -> list | None:
     """从 API 返回的各种嵌套结构中提取 items 列表。"""
     if isinstance(data, list):
@@ -685,6 +722,9 @@ _FILTER_KEYWORDS = {
     "附近有医院": ["tags", "近医院"],
     "附近有学校": ["tags", "近学校"],
     "附近有健身房": ["tags", "近健身房"],
+    "附近可健身": ["tags", "近健身房"],
+    "健身的地方": ["tags", "近健身房"],
+    "可以健身": ["tags", "近健身房"],
     "附近有商超": ["tags", "近商超"],
     "附近有商场": ["tags", "近商超"],
     "附近有餐饮": ["tags", "近餐饮"],
@@ -721,6 +761,10 @@ _FILTER_KEYWORDS = {
     "能接受宠物": ["tags", "可养宠物"],
     "养仓鼠": ["tags", "可养宠物"],
     "仓鼠": ["tags", "可养宠物"],
+    "采光好": ["tags", "采光好"],
+    "有阳光": ["tags", "采光好"],
+    "采光": ["tags", "采光好"],
+    "亮堂": ["tags", "采光好"],
     "养狗": ["tags", "可养狗"],
     "能养狗": ["tags", "可养狗"],
     "养金毛": ["tags", "可养狗"],
@@ -845,6 +889,7 @@ async def _do_multi_turn_filter(
         return (s[0], s[1], False)
 
     matched: list[str] = []
+    matched_items: list[dict] = []
     tool_results: list[dict] = []
     for hid in last_house_ids[:5]:
         if _is_likely_fake_house_id(hid):
@@ -863,8 +908,9 @@ async def _do_multi_turn_filter(
             continue
         if all(_house_matches_spec(h, f, e, ex) for f, e, ex in (_unpack_spec(s) for s in specs)):
             matched.append(hid)
+            matched_items.append(h)
     if matched:
-        msg = f"已为您筛选出{len(matched)}套符合条件的房源"
+        msg = _format_houses_to_message(matched_items, matched)
         return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results)
     msg = "暂无符合该条件的房源，建议调整筛选"
     return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [])
@@ -1041,7 +1087,7 @@ async def _do_community_search(community: str, user_id: str) -> str:
             hid = item.get("house_id") or item.get("id")
             if hid:
                 ids.append(str(hid))
-    msg = f"为您找到{len(ids)}套{community}房源" if ids else f"暂未找到{community}在租房源"
+    msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{community}在租房源"
     return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
 
 
@@ -1071,7 +1117,7 @@ async def _do_landmark_search(landmark_q: str, max_dist: int, user_id: str) -> s
             hid = item.get("house_id") or item.get("id")
             if hid:
                 ids.append(str(hid))
-    msg = f"为您找到{len(ids)}套{landmark_q}附近房源" if ids else f"暂未找到{landmark_q}附近在租房源"
+    msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{landmark_q}附近在租房源"
     return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
 
 
@@ -1129,11 +1175,11 @@ async def _do_direct_search(params: dict, user_id: str) -> str:
     house_ids = house_ids[:5]
 
     if house_ids:
-        msg = f"为您找到{len(house_ids)}套符合条件的房源"
+        msg = _format_houses_to_message(items, house_ids)
         if did_platform_fallback:
-            msg = "当前为您展示安居客房源。" + msg
+            msg = "当前为您展示安居客房源。\n" + msg
         elif did_subway_fallback:
-            msg = "已放宽地铁站距离限制。" + msg
+            msg = "已放宽地铁站距离限制。\n" + msg
     else:
         msg = "暂无符合条件的房源，建议调整筛选条件"
 
@@ -1377,6 +1423,18 @@ async def chat(req: ChatRequest) -> ChatResponse:
             t_tool = time.time()
             try:
                 raw_out = await run_tool(fn, args, user_id)
+                # 链家/58 无数据时自动回退安居客
+                if fn == "get_houses_by_platform" and args.get("listing_platform") in ("链家", "58同城"):
+                    try:
+                        data = json.loads(raw_out)
+                        items = _extract_items(data) or []
+                        if not items:
+                            retry_args = {k: v for k, v in args.items() if k != "listing_platform"}
+                            retry_args["listing_platform"] = "安居客"
+                            service_log.info("[FALLBACK] 链家/58无数据，回退安居客重试")
+                            raw_out = await run_tool(fn, retry_args, user_id)
+                    except json.JSONDecodeError:
+                        pass
             except Exception as e:
                 raw_out = json.dumps({"error": str(e)})
             
