@@ -703,6 +703,10 @@ _FILTER_KEYWORDS = {
     "可养猫": ["tags", "可养猫"],
     "可养狗": ["tags", "可养狗"],
     "可养宠物": ["tags", "可养宠物"],
+    "养狗": ["tags", "可养狗"],
+    "能养狗": ["tags", "可养狗"],
+    "养金毛": ["tags", "可养狗"],
+    "养大型犬": ["tags", "可养狗"],
     "仅限小型犬": ["tags", "仅限小型犬"],
     "可月租": ["tags", "可月租"],
     "可租3个月": ["tags", "可租3个月"],
@@ -719,6 +723,9 @@ _FILTER_KEYWORDS = {
     "民水民电": ["utilities_type", "民水民电"],
 }
 
+# 大型犬关键词：用户说这些时，需排除「仅限小型犬」房源
+_LARGE_DOG_KEYWORDS = ["金毛", "大型犬", "哈士奇", "德牧", "拉布拉多", "阿拉斯加"]
+
 
 def _get_filter_from_message(msg: str) -> tuple[str, Any] | None:
     """从消息提取追加筛选条件，返回 (field, expected) 或 None。"""
@@ -728,38 +735,49 @@ def _get_filter_from_message(msg: str) -> tuple[str, Any] | None:
     return None
 
 
-def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any]]:
-    """从消息提取所有匹配的筛选条件，多条件取交集。"""
-    return [(f, e) for kw, (f, e) in _FILTER_KEYWORDS.items() if kw in msg]
+def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any, ...]]:
+    """从消息提取所有匹配的筛选条件，多条件取交集。含排除型：(field, expected, exclude=True)。"""
+    specs: list[tuple[str, Any, ...]] = [(f, e) for kw, (f, e) in _FILTER_KEYWORDS.items() if kw in msg]
+    if any(kw in msg for kw in _LARGE_DOG_KEYWORDS):
+        specs.append(("tags", "仅限小型犬", True))  # exclude：大型犬时排除仅限小型犬
+    return specs
 
 
-def _house_matches_spec(h: dict, field: str, expected: Any) -> bool:
-    """判断房源 h 是否满足 (field, expected) 条件。"""
+def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = False) -> bool:
+    """判断房源 h 是否满足条件。exclude=True 时：若 field 含 expected 则不符合。"""
     if field == "hidden_noise_level":
         val = h.get("hidden_noise_level") or ""
-        return expected in str(val)
-    if field == "elevator":
+        matched = expected in str(val)
+    elif field == "elevator":
         val = h.get("elevator")
-        return val is True or str(val).lower() in ("true", "1", "有")
-    if field == "utilities_type":
+        matched = val is True or str(val).lower() in ("true", "1", "有")
+    elif field == "utilities_type":
         val = h.get("utilities_type") or ""
-        return expected in str(val)
-    if field == "orientation":
+        matched = expected in str(val)
+    elif field == "orientation":
         val = h.get("orientation") or ""
-        return expected in str(val)
-    if field == "tags":
+        matched = expected in str(val)
+    elif field == "tags":
         tags = h.get("tags") or []
-        return expected in tags
-    return False
+        matched = expected in tags
+    else:
+        return False
+    return not matched if exclude else matched
 
 
 async def _do_multi_turn_filter(
-    last_house_ids: list[str], filter_spec: tuple[str, Any] | list[tuple[str, Any]], user_id: str
+    last_house_ids: list[str], filter_spec: tuple[str, Any, ...] | list[tuple[str, Any, ...]], user_id: str
 ) -> tuple[str, list[dict]] | None:
-    """多轮筛选：对 last_house_ids 逐个 get_house_by_id，多条件取交集。"""
+    """多轮筛选：对 last_house_ids 逐个 get_house_by_id，多条件取交集。支持排除型 (field, expected, exclude=True)。"""
     specs = [filter_spec] if isinstance(filter_spec, tuple) else filter_spec
     if not specs:
         return None
+
+    def _unpack_spec(s: tuple[str, Any, ...]) -> tuple[str, Any, bool]:
+        if len(s) >= 3:
+            return (s[0], s[1], bool(s[2]))
+        return (s[0], s[1], False)
+
     matched: list[str] = []
     tool_results: list[dict] = []
     for hid in last_house_ids[:5]:
@@ -777,7 +795,7 @@ async def _do_multi_turn_filter(
             continue
         if not isinstance(h, dict):
             continue
-        if all(_house_matches_spec(h, field, expected) for field, expected in specs):
+        if all(_house_matches_spec(h, f, e, ex) for f, e, ex in (_unpack_spec(s) for s in specs)):
             matched.append(hid)
     if matched:
         msg = f"已为您筛选出{len(matched)}套符合条件的房源"
