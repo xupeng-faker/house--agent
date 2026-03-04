@@ -668,7 +668,16 @@ async def _do_terminate_rental_shortcut(
 
 # 多轮追加筛选：用 get_house_by_id 过滤，不重新搜索（更具体的词放前面优先匹配）
 _FILTER_KEYWORDS = {
+    "水电费包在房租": ["tags", "包水电费"],
+    "水电费包": ["tags", "包水电费"],
+    "租金包水电": ["tags", "包水电费"],
+    "包水电": ["tags", "包水电费"],
+    "网费包在房租": ["tags", "包宽带"],
+    "网费包": ["tags", "包宽带"],
+    "宽带包": ["tags", "包宽带"],
+    "网费包含": ["tags", "包宽带"],
     "附近有公园": ["tags", "近公园"],
+    "近公园": ["tags", "近公园"],
     "附近有菜市场": ["tags", "近菜市场"],
     "附近有医院": ["tags", "近医院"],
     "附近有学校": ["tags", "近学校"],
@@ -719,11 +728,38 @@ def _get_filter_from_message(msg: str) -> tuple[str, Any] | None:
     return None
 
 
+def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any]]:
+    """从消息提取所有匹配的筛选条件，多条件取交集。"""
+    return [(f, e) for kw, (f, e) in _FILTER_KEYWORDS.items() if kw in msg]
+
+
+def _house_matches_spec(h: dict, field: str, expected: Any) -> bool:
+    """判断房源 h 是否满足 (field, expected) 条件。"""
+    if field == "hidden_noise_level":
+        val = h.get("hidden_noise_level") or ""
+        return expected in str(val)
+    if field == "elevator":
+        val = h.get("elevator")
+        return val is True or str(val).lower() in ("true", "1", "有")
+    if field == "utilities_type":
+        val = h.get("utilities_type") or ""
+        return expected in str(val)
+    if field == "orientation":
+        val = h.get("orientation") or ""
+        return expected in str(val)
+    if field == "tags":
+        tags = h.get("tags") or []
+        return expected in tags
+    return False
+
+
 async def _do_multi_turn_filter(
-    last_house_ids: list[str], filter_spec: tuple[str, Any], user_id: str
+    last_house_ids: list[str], filter_spec: tuple[str, Any] | list[tuple[str, Any]], user_id: str
 ) -> tuple[str, list[dict]] | None:
-    """多轮筛选：对 last_house_ids 逐个 get_house_by_id，按条件过滤。"""
-    field, expected = filter_spec
+    """多轮筛选：对 last_house_ids 逐个 get_house_by_id，多条件取交集。"""
+    specs = [filter_spec] if isinstance(filter_spec, tuple) else filter_spec
+    if not specs:
+        return None
     matched: list[str] = []
     tool_results: list[dict] = []
     for hid in last_house_ids[:5]:
@@ -735,36 +771,19 @@ async def _do_multi_turn_filter(
         except Exception:
             continue
         try:
-            h = json.loads(raw)
+            data = json.loads(raw)
+            h = data.get("data") or data.get("house") or data
         except json.JSONDecodeError:
             continue
         if not isinstance(h, dict):
             continue
-        if field == "hidden_noise_level":
-            val = h.get("hidden_noise_level") or ""
-            if expected in str(val):
-                matched.append(hid)
-        elif field == "elevator":
-            val = h.get("elevator")
-            if val is True or str(val).lower() == "true":
-                matched.append(hid)
-        elif field == "utilities_type":
-            val = h.get("utilities_type") or ""
-            if expected in str(val):
-                matched.append(hid)
-        elif field == "orientation":
-            val = h.get("orientation") or ""
-            if expected in str(val):
-                matched.append(hid)
-        elif field == "tags":
-            tags = h.get("tags") or []
-            if expected in tags:
-                matched.append(hid)
-    if not matched:
-        msg = "暂无符合该条件的房源，建议调整筛选"
-    else:
+        if all(_house_matches_spec(h, field, expected) for field, expected in specs):
+            matched.append(hid)
+    if matched:
         msg = f"已为您筛选出{len(matched)}套符合条件的房源"
-    return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results)
+        return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results)
+    msg = "暂无符合该条件的房源，建议调整筛选"
+    return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [])
 
 
 def _try_direct_search(msg: str) -> dict | None:
@@ -1166,9 +1185,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
         )
 
     # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
-    filter_spec = _get_filter_from_message(user_message)
-    if filter_spec and last_house_ids:
-        filter_result = await _do_multi_turn_filter(last_house_ids, filter_spec, user_id)
+    filter_specs = _get_all_filters_from_message(user_message)
+    if filter_specs and last_house_ids:
+        filter_result = await _do_multi_turn_filter(last_house_ids, filter_specs, user_id)
         if filter_result:
             result_str, tool_results = filter_result
             start_ts = time.time()
