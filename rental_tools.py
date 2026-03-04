@@ -298,12 +298,12 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_nearby_landmarks",
-                "description": "查小区周边配套(商超/公园)",
+                "description": "查小区周边配套。type=park 查公园(遛狗等)，type=shopping 查商超。需先有房源得小区名，再查该小区周边。用于「附近有公园」「能遛狗」等需求。",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "community": {"type": "string"},
-                        "type": {"type": "string", "description": "shopping/park"},
+                        "type": {"type": "string", "description": "park=公园, shopping=商超"},
                         "max_distance_m": {"type": "number"},
                     },
                     "required": ["community"],

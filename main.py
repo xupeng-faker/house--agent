@@ -82,6 +82,19 @@ def _normalize_house_id(x: Any) -> str | None:
     return str(x) if x else None
 
 
+def _strip_markdown(text: str) -> str:
+    """去除 message 中的 Markdown 格式，保留纯文本。"""
+    if not text:
+        return text
+    # 去除 **bold** 格式
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    # 去除 *italic* 格式
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    # 将多余换行合并为单个换行
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
 def _clean_and_enforce_limit(json_str: str) -> str:
     """严格输出仅含 message 和 houses 的 JSON，符合评测要求。"""
     try:
@@ -97,9 +110,76 @@ def _clean_and_enforce_limit(json_str: str) -> str:
             hid = _normalize_house_id(h)
             if hid and hid.startswith("HF_"):
                 normalized.append(hid)
-        return json.dumps({"message": d.get("message", ""), "houses": normalized}, ensure_ascii=False)
+        message = _strip_markdown(d.get("message", ""))
+        return json.dumps({"message": message, "houses": normalized}, ensure_ascii=False)
     except Exception:
         return json_str
+
+
+# get_houses_by_platform 支持的参数（API 无 tags 参数，需过滤）
+_PLATFORM_VALID_KEYS = frozenset({
+    "listing_platform", "district", "area", "min_price", "max_price", "bedrooms",
+    "rental_type", "decoration", "orientation", "elevator", "min_area", "max_area",
+    "subway_line", "max_subway_dist", "subway_station", "commute_to_xierqi_max",
+    "sort_by", "sort_order", "page", "page_size",
+})
+
+_SEARCH_TOOLS = frozenset({
+    "get_houses_by_platform", "get_houses_nearby", "get_houses_by_community",
+    "search_landmarks", "get_landmark_by_name", "get_landmarks", "get_landmark_by_id",
+})
+
+
+def _parse_tool_call_content(text: str) -> tuple[str, dict] | None:
+    """若 content 形如 {"name":"xxx","arguments":{...}} 则解析，否则返回 None。"""
+    if not text or not text.strip():
+        return None
+    try:
+        d = json.loads(text.strip())
+        if not isinstance(d, dict):
+            return None
+        name = d.get("name")
+        args = d.get("arguments")
+        if name and isinstance(args, dict):
+            return str(name), args
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str | None:
+    """尝试将 content 中的 tool call 形态解析并执行，返回格式化结果或 None。"""
+    parsed = _parse_tool_call_content(content)
+    if not parsed:
+        return None
+    name, args = parsed
+    if name not in _SEARCH_TOOLS:
+        return None
+    # 过滤非法参数（如 tags）
+    if name == "get_houses_by_platform":
+        args = {k: v for k, v in args.items() if k in _PLATFORM_VALID_KEYS and v is not None}
+    else:
+        args = {k: v for k, v in args.items() if v is not None}
+    if not args and name in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community"):
+        return None
+    try:
+        raw = await run_tool(name, args, user_id)
+        if not raw or "error" in raw.lower()[:200]:
+            return None
+        data = json.loads(raw)
+        items = _extract_items(data)
+        house_ids = []
+        for item in (items or []):
+            if isinstance(item, dict):
+                hid = item.get("house_id") or item.get("id")
+                if hid:
+                    house_ids.append(str(hid))
+        house_ids = house_ids[:5]
+        msg = f"为您找到{len(house_ids)}套符合条件的房源" if house_ids else "暂无符合条件的房源，建议调整筛选条件"
+        return json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False)
+    except (json.JSONDecodeError, Exception) as e:
+        service_log.warning("[TOOL_CALL_FALLBACK] 兜底执行失败: %s", e)
+        return None
 
 
 def _ensure_strict_json_response(text: str) -> str:
@@ -418,7 +498,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 构建模型消息：系统提示 + 压缩历史
     model_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     
-    KEEP_RECENT = 10
+    KEEP_RECENT = 14
     total_msgs = len(messages)
     
     for i, m in enumerate(messages):
@@ -452,7 +532,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         round_count += 1
         service_log.info("[LOOP] session=%s round=%d/%d 开始模型调用", session_id, round_count, MAX_TOOL_ROUNDS)
         
-        current_tools = tools_schema if round_count <= 3 else None
+        current_tools = tools_schema if round_count <= 5 else None
         
         response = await chat_completions(req.model_ip, model_messages, tools=current_tools, session_id=session_id)
         content, tool_calls = parse_assistant_message(response)
@@ -460,7 +540,15 @@ async def chat(req: ChatRequest) -> ChatResponse:
         if not tool_calls:
             response_text = content or ""
             service_log.info("[LOOP] session=%s round=%d 模型返回文本(无tool_calls), len=%d", session_id, round_count, len(response_text))
-            response_text = _ensure_strict_json_response(response_text)
+            # 兜底：若 content 为 tool call 形态（模型误输出），尝试执行
+            if _parse_tool_call_content(response_text):
+                fallback_result = await _try_execute_tool_call_from_content(response_text, user_id)
+                if fallback_result:
+                    response_text = _ensure_strict_json_response(fallback_result)
+                else:
+                    response_text = json.dumps({"message": "抱歉，请重新描述您的需求", "houses": []}, ensure_ascii=False)
+            else:
+                response_text = _ensure_strict_json_response(response_text)
             append_messages(session_id, {"role": "assistant", "content": response_text})
             break
 
