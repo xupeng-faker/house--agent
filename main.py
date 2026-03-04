@@ -16,8 +16,10 @@ from rental_tools import get_tools_schema, init_houses, run_tool
 from session_store import (
     append_messages,
     get_messages,
+    get_last_search_house_ids,
     is_initialized,
     set_initialized,
+    set_last_search_house_ids,
     set_messages,
 )
 
@@ -1052,9 +1054,9 @@ def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = Fals
 
 
 async def _do_multi_turn_filter(
-    last_house_ids: list[str], filter_spec: tuple[str, Any, ...] | list[tuple[str, Any, ...]], user_id: str
-) -> tuple[str, list[dict]] | None:
-    """多轮筛选：对 last_house_ids 逐个 get_house_by_id，多条件取交集。支持排除型 (field, expected, exclude=True)。"""
+    house_ids_to_filter: list[str], filter_spec: tuple[str, Any, ...] | list[tuple[str, Any, ...]], user_id: str
+) -> tuple[str, list[dict], list[str]] | None:
+    """多轮筛选：对 house_ids_to_filter（完整筛选池）逐个 get_house_by_id，多条件取交集。返回 (result_json, tool_results, 全量匹配 ID 列表)。"""
     specs = [filter_spec] if isinstance(filter_spec, tuple) else filter_spec
     if not specs:
         return None
@@ -1067,7 +1069,7 @@ async def _do_multi_turn_filter(
     matched: list[str] = []
     matched_items: list[dict] = []
     tool_results: list[dict] = []
-    for hid in last_house_ids[:5]:
+    for hid in house_ids_to_filter:
         if _is_likely_fake_house_id(hid):
             continue
         try:
@@ -1087,9 +1089,9 @@ async def _do_multi_turn_filter(
             matched_items.append(h)
     if matched:
         msg = _format_houses_to_message(matched_items, matched)
-        return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results)
+        return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results, matched)
     msg = "暂无符合该条件的房源，可考虑放宽部分要求或查看其他区域"
-    return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [])
+    return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [], [])
 
 
 def _try_direct_search(msg: str) -> dict | list[dict] | None:
@@ -1370,13 +1372,13 @@ def _try_landmark_query(msg: str) -> tuple[str, int] | None:
     return None
 
 
-async def _do_community_search(community: str, user_id: str) -> str:
-    """小区查房：get_houses_by_community。"""
+async def _do_community_search(community: str, user_id: str) -> tuple[str, list[str]]:
+    """小区查房：get_houses_by_community。返回 (结果 JSON, 完整房源 ID 列表)。"""
     try:
         raw = await run_tool("get_houses_by_community", {"community": community}, user_id)
     except Exception as e:
         service_log.warning("[COMMUNITY] 查询失败: %s", e)
-        return json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False), [])
     items = _extract_items(json.loads(raw)) if raw else []
     ids = []
     for item in (items or []):
@@ -1385,11 +1387,11 @@ async def _do_community_search(community: str, user_id: str) -> str:
             if hid:
                 ids.append(str(hid))
     msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{community}在租房源"
-    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+    return (json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False), ids)
 
 
-async def _do_nearby_type_search(params: dict, user_id: str) -> str:
-    """首轮健身房/医院/公园地标链：search_landmarks(district) → get_houses_nearby → 按预算/户型过滤。"""
+async def _do_nearby_type_search(params: dict, user_id: str) -> tuple[str, list[str]]:
+    """首轮健身房/医院/公园地标链。返回 (结果 JSON, 完整房源 ID 列表)。"""
     district = params.get("district", "")
     landmark_q = params.get("landmark_q", "健身房")
     max_price = params.get("max_price")
@@ -1399,18 +1401,18 @@ async def _do_nearby_type_search(params: dict, user_id: str) -> str:
         data = json.loads(raw_search)
     except Exception as e:
         service_log.warning("[NEARBY_TYPE] search_landmarks 失败: %s", e)
-        return json.dumps({"message": "地标查询失败，请稍后重试", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": "地标查询失败，请稍后重试", "houses": []}, ensure_ascii=False), [])
     landmarks = data.get("landmarks") or data.get("items") or _extract_items(data) or []
     if not landmarks or not isinstance(landmarks[0], dict):
-        return json.dumps({"message": f"未找到{district}{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": f"未找到{district}{landmark_q}附近房源", "houses": []}, ensure_ascii=False), [])
     lid = str(landmarks[0].get("id") or landmarks[0].get("landmark_id") or "")
     if not lid:
-        return json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False), [])
     try:
         raw_nearby = await run_tool("get_houses_nearby", {"landmark_id": lid, "max_distance": 1000}, user_id)
     except Exception as e:
         service_log.warning("[NEARBY_TYPE] get_houses_nearby 失败: %s", e)
-        return json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False), [])
     items = _extract_items(json.loads(raw_nearby)) if raw_nearby else []
     filtered: list[dict] = []
     for item in (items or []):
@@ -1431,28 +1433,28 @@ async def _do_nearby_type_search(params: dict, user_id: str) -> str:
         filtered.append(item)
     ids = [str(i.get("house_id") or i.get("id") or "") for i in filtered if i.get("house_id") or i.get("id")]
     msg = _format_houses_to_message(filtered[:5], ids[:5]) if ids else f"暂未找到{district}{landmark_q}附近符合条件的房源"
-    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+    return (json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False), ids)
 
 
-async def _do_landmark_search(landmark_q: str, max_dist: int, user_id: str) -> str:
-    """地标附近查房：search_landmarks → get_houses_nearby。"""
+async def _do_landmark_search(landmark_q: str, max_dist: int, user_id: str) -> tuple[str, list[str]]:
+    """地标附近查房：search_landmarks → get_houses_nearby。返回 (结果 JSON, 完整房源 ID 列表)。"""
     try:
         raw_search = await run_tool("search_landmarks", {"q": landmark_q}, user_id)
         data = json.loads(raw_search)
     except Exception as e:
         service_log.warning("[LANDMARK] search_landmarks 失败: %s", e)
-        return json.dumps({"message": "地标查询失败，请稍后重试", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": "地标查询失败，请稍后重试", "houses": []}, ensure_ascii=False), [])
     landmarks = data.get("landmarks") or data.get("items") or _extract_items(data) or []
     if not landmarks or not isinstance(landmarks[0], dict):
-        return json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False), [])
     lid = landmarks[0].get("id") or landmarks[0].get("landmark_id") or ""
     if not lid:
-        return json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": f"未找到{landmark_q}附近房源", "houses": []}, ensure_ascii=False), [])
     try:
         raw_nearby = await run_tool("get_houses_nearby", {"landmark_id": lid, "max_distance": max_dist}, user_id)
     except Exception as e:
         service_log.warning("[LANDMARK] get_houses_nearby 失败: %s", e)
-        return json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False), [])
     items = _extract_items(json.loads(raw_nearby)) if raw_nearby else []
     ids = []
     for item in (items or []):
@@ -1461,18 +1463,18 @@ async def _do_landmark_search(landmark_q: str, max_dist: int, user_id: str) -> s
             if hid:
                 ids.append(str(hid))
     msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{landmark_q}附近在租房源"
-    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+    return (json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False), ids)
 
 
-async def _do_direct_search(params: dict, user_id: str) -> str:
-    """直接调用 get_houses_by_platform 并格式化为标准 JSON 输出。"""
+async def _do_direct_search(params: dict, user_id: str) -> tuple[str, list[str]]:
+    """直接调用 get_houses_by_platform。返回 (结果 JSON, 完整房源 ID 列表)。"""
     raw_out = await run_tool("get_houses_by_platform", params, user_id)
 
     try:
         data = json.loads(raw_out)
     except json.JSONDecodeError:
         service_log.error("[DIRECT] raw_out 非 JSON: %s", raw_out[:500])
-        return json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False)
+        return (json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False), [])
 
     items = _extract_items(data) or []
     did_platform_fallback = False
@@ -1515,6 +1517,7 @@ async def _do_direct_search(params: dict, user_id: str) -> str:
             hid = item.get("house_id") or item.get("id")
             if hid:
                 house_ids.append(str(hid))
+    house_ids_full = house_ids  # 完整列表供多轮过滤
     house_ids = house_ids[:5]
 
     if house_ids:
@@ -1526,10 +1529,10 @@ async def _do_direct_search(params: dict, user_id: str) -> str:
     else:
         msg = "暂无符合条件的房源，建议调整筛选条件"
 
-    return json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False)
+    return (json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False), house_ids_full)
 
 
-async def _do_multi_district_search(params_list: list[dict], user_id: str) -> str:
+async def _do_multi_district_search(params_list: list[dict], user_id: str) -> tuple[str, list[str]]:
     """双区域查询：分别搜每个 district，合并去重取前5。"""
     seen: set[str] = set()
     all_items: list[dict] = []
@@ -1553,7 +1556,7 @@ async def _do_multi_district_search(params_list: list[dict], user_id: str) -> st
             break
     ids = [str(i.get("house_id") or i.get("id") or "") for i in all_items if i.get("house_id") or i.get("id")]
     msg = _format_houses_to_message(all_items, ids) if ids else "暂无符合该条件的房源，建议调整筛选条件"
-    return json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False)
+    return (json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False), ids)
 
 
 # --------------- 核心 chat 接口 ---------------
@@ -1596,9 +1599,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
         community = _try_community_query(user_message)
         if community:
             try:
-                direct_result = await _do_community_search(community, user_id)
+                direct_result, full_ids = await _do_community_search(community, user_id)
                 tool_name = "get_houses_by_community"
                 tool_output = direct_result
+                if full_ids:
+                    set_last_search_house_ids(session_id, full_ids)
             except Exception as e:
                 service_log.warning("[SHORT] session=%s 小区搜索失败: %s", session_id, e)
         # 2b: 地标附近查房（望京南、双合站等）
@@ -1607,9 +1612,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
             if landmark_q:
                 lm_name, lm_dist = landmark_q
                 try:
-                    direct_result = await _do_landmark_search(lm_name, lm_dist, user_id)
+                    direct_result, full_ids = await _do_landmark_search(lm_name, lm_dist, user_id)
                     tool_name = "get_houses_nearby"
                     tool_output = direct_result
+                    if full_ids:
+                        set_last_search_house_ids(session_id, full_ids)
                 except Exception as e:
                     service_log.warning("[SHORT] session=%s 地标搜索失败: %s", session_id, e)
         # 2b2: 首轮健身房/医院/公园地标链（EV-032：希望附近有健身房+区县+预算）
@@ -1617,9 +1624,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
             nearby_params = _try_nearby_type_search(user_message)
             if nearby_params:
                 try:
-                    direct_result = await _do_nearby_type_search(nearby_params, user_id)
+                    direct_result, full_ids = await _do_nearby_type_search(nearby_params, user_id)
                     tool_name = "search_landmarks+get_houses_nearby"
                     tool_output = direct_result
+                    if full_ids:
+                        set_last_search_house_ids(session_id, full_ids)
                 except Exception as e:
                     service_log.warning("[SHORT] session=%s 健身房地标链失败: %s", session_id, e)
         # 2c: 区县+条件查房（含双区域 丰台或朝阳）
@@ -1628,11 +1637,13 @@ async def chat(req: ChatRequest) -> ChatResponse:
             if search_params is not None:
                 try:
                     if isinstance(search_params, list):
-                        direct_result = await _do_multi_district_search(search_params, user_id)
+                        direct_result, full_ids = await _do_multi_district_search(search_params, user_id)
                     else:
-                        direct_result = await _do_direct_search(search_params, user_id)
+                        direct_result, full_ids = await _do_direct_search(search_params, user_id)
                     tool_name = "get_houses_by_platform"
                     tool_output = direct_result
+                    if full_ids:
+                        set_last_search_house_ids(session_id, full_ids)
                 except Exception as e:
                     service_log.warning("[SHORT] session=%s 直接搜索失败: %s", session_id, e)
         if tool_output:
@@ -1700,13 +1711,17 @@ async def chat(req: ChatRequest) -> ChatResponse:
         )
 
     # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
+    # 优先使用完整筛选池；无则回退到推荐 5 套
+    house_ids_to_filter = get_last_search_house_ids(session_id) or last_house_ids
     filter_specs = _get_all_filters_from_message(user_message)
     if "压一半" in user_message and last_house_ids:
         filter_specs = await _merge_budget_half_spec(user_message, last_house_ids, user_id, filter_specs)
-    if filter_specs and last_house_ids:
-        filter_result = await _do_multi_turn_filter(last_house_ids, filter_specs, user_id)
+    if filter_specs and house_ids_to_filter:
+        filter_result = await _do_multi_turn_filter(house_ids_to_filter, filter_specs, user_id)
         if filter_result:
-            result_str, tool_results = filter_result
+            result_str, tool_results, matched_ids = filter_result
+            if matched_ids:
+                set_last_search_house_ids(session_id, matched_ids)
             start_ts = time.time()
             append_messages(session_id, {"role": "user", "content": user_message})
             append_messages(session_id, {"role": "assistant", "content": result_str})
@@ -1766,9 +1781,15 @@ async def chat(req: ChatRequest) -> ChatResponse:
             response_text = content or ""
             # 收集有效ID
             valid_house_ids = set()
+            full_ids_from_search: list[str] = []
             for tr in tool_results:
-                for hid in _extract_house_ids_from_tool_output(tr.get("output", "") or ""):
+                ids = _extract_house_ids_from_tool_output(tr.get("output", "") or "")
+                for hid in ids:
                     valid_house_ids.add(hid)
+                if tr.get("name") in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community") and ids:
+                    full_ids_from_search.extend(ids)
+            if full_ids_from_search:
+                set_last_search_house_ids(session_id, list(dict.fromkeys(full_ids_from_search)))
             
             # 尝试修复误输出的 tool call 文本
             parsed = _parse_tool_call_content(response_text)
@@ -1839,9 +1860,15 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # 循环耗尽或 LLM 返回空时兜底：从 tool_results 合成响应
     if not response_text or not response_text.strip():
         valid_house_ids = set()
+        full_ids_from_search = []
         for tr in tool_results:
-            for hid in _extract_house_ids_from_tool_output(tr.get("output", "") or ""):
+            ids = _extract_house_ids_from_tool_output(tr.get("output", "") or "")
+            for hid in ids:
                 valid_house_ids.add(hid)
+            if tr.get("name") in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community") and ids:
+                full_ids_from_search.extend(ids)
+        if full_ids_from_search:
+            set_last_search_house_ids(session_id, list(dict.fromkeys(full_ids_from_search)))
         if valid_house_ids:
             ids_list = list(valid_house_ids)[:5]
             response_text = json.dumps(

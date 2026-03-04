@@ -32,3 +32,16 @@ def set_initialized(session_id: str, value: bool = True) -> None:
     if session_id not in _sessions:
         _sessions[session_id] = {"messages": [], "initialized": False}
     _sessions[session_id]["initialized"] = value
+
+
+def set_last_search_house_ids(session_id: str, house_ids: list[str]) -> None:
+    """保存最近一次搜索/筛选得到的完整房源 ID 列表，供多轮过滤使用。"""
+    get_messages(session_id)
+    _sessions[session_id]["last_search_house_ids"] = list(house_ids)
+
+
+def get_last_search_house_ids(session_id: str) -> list[str]:
+    """获取最近一次搜索/筛选的完整房源 ID 列表。若无则返回空列表。"""
+    if session_id not in _sessions:
+        return []
+    return list(_sessions[session_id].get("last_search_house_ids", []))
