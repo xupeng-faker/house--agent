@@ -248,7 +248,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_houses_by_platform",
-                "description": "条件查房。params: district, price, bedrooms, subway_dist, commute_to_xierqi_max... listing_platform 为可选，不传时搜索所有平台；若指定链家/58 无结果，建议不传该参数重试。",
+                "description": "条件查房。params: district, price, bedrooms, subway_dist, commute_to_xierqi_max... listing_platform 为可选，不传时搜索所有平台；若指定链家/58 无结果，必须不传或改安居客重试。注意：望京南、立水桥站、金融街、公司附近等商圈/地标需求，应先用 search_landmarks 获 landmark_id，再用 get_houses_nearby，勿用本接口按 district 搜。",
                 "parameters": {
                     "type": "object",
                     "properties": {

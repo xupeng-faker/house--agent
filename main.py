@@ -95,7 +95,43 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _clean_and_enforce_limit(json_str: str) -> str:
+# 已知虚假/占位房源 ID 模式（模型臆造）
+_FAKE_HOUSE_ID_PATTERNS = frozenset({"HF_12345", "HF_67890", "HF_11111", "HF_22222", "HF_99999", "HF_00000"})
+
+
+def _is_likely_fake_house_id(hid: str) -> bool:
+    """检测是否为明显占位符 ID。"""
+    if not hid or not hid.startswith("HF_"):
+        return True
+    if hid in _FAKE_HOUSE_ID_PATTERNS:
+        return True
+    # HF_12345、HF_67890 等 5 位连续数字常见占位
+    suffix = hid[3:]
+    if suffix.isdigit() and len(suffix) >= 5:
+        num = int(suffix)
+        if num in (12345, 67890, 11111, 22222, 33333, 44444, 55555, 66666, 77777, 88888, 99999):
+            return True
+    return False
+
+
+def _unwrap_nested_json(msg: str) -> tuple[str, list[str]] | None:
+    """若 message 为内嵌 JSON 字符串，解析并返回 (message, houses)；否则返回 None。"""
+    if not msg or not isinstance(msg, str) or not msg.strip().startswith("{"):
+        return None
+    try:
+        inner = json.loads(msg.strip())
+        if isinstance(inner, dict) and "message" in inner and "houses" in inner:
+            inner_msg = inner.get("message", "")
+            inner_houses = inner.get("houses", [])
+            if not isinstance(inner_houses, list):
+                inner_houses = []
+            return str(inner_msg), [str(h) for h in inner_houses if isinstance(h, str) and h.startswith("HF_")]
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def _clean_and_enforce_limit(json_str: str, valid_house_ids: set[str] | None = None) -> str:
     """严格输出仅含 message 和 houses 的 JSON，符合评测要求。"""
     try:
         raw = json_str.strip()
@@ -105,12 +141,29 @@ def _clean_and_enforce_limit(json_str: str) -> str:
         houses = d.get("houses", [])
         if not isinstance(houses, list):
             houses = []
+        message = _strip_markdown(d.get("message", ""))
+
+        # 修复双重 JSON 编码：若 message 为内嵌 JSON，解析取内层
+        unwrapped = _unwrap_nested_json(message)
+        if unwrapped:
+            message, houses = unwrapped
+
         normalized = []
         for h in houses[:5]:
             hid = _normalize_house_id(h)
-            if hid and hid.startswith("HF_"):
-                normalized.append(hid)
-        message = _strip_markdown(d.get("message", ""))
+            if not hid or not hid.startswith("HF_"):
+                continue
+            # 虚假 ID 防护
+            if _is_likely_fake_house_id(hid):
+                continue
+            if valid_house_ids is not None and hid not in valid_house_ids:
+                continue
+            normalized.append(hid)
+
+        # 若过滤后 houses 为空但原有过可疑 ID，修正 message
+        if not normalized and houses and any(_is_likely_fake_house_id(_normalize_house_id(h) or "") for h in houses[:5]):
+            message = "暂未找到符合条件的房源，建议调整筛选条件"
+
         return json.dumps({"message": message, "houses": normalized}, ensure_ascii=False)
     except Exception:
         return json_str
@@ -204,16 +257,31 @@ async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str
         return None
 
 
-def _ensure_strict_json_response(text: str) -> str:
+def _extract_house_ids_from_tool_output(output: str) -> list[str]:
+    """从工具返回的 JSON 中提取 house_id 列表。"""
+    ids = []
+    try:
+        data = json.loads(output)
+        for item in _extract_items(data) or []:
+            if isinstance(item, dict):
+                hid = item.get("house_id") or item.get("id")
+                if hid and str(hid).startswith("HF_"):
+                    ids.append(str(hid))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return ids
+
+
+def _ensure_strict_json_response(text: str, valid_house_ids: set[str] | None = None) -> str:
     """最终兜底：规范为仅 message+houses 的 JSON，符合评测要求。"""
     if not text or not text.strip():
         return text
     extracted = _try_extract_json(text)
     if extracted:
-        return _clean_and_enforce_limit(extracted)
+        return _clean_and_enforce_limit(extracted, valid_house_ids)
     fallback = _fallback_extract_houses(text)
     if fallback:
-        return _clean_and_enforce_limit(fallback)
+        return _clean_and_enforce_limit(fallback, valid_house_ids)
     return text
 
 
@@ -287,15 +355,17 @@ def _compress_tool_output(tool_name: str, output: str) -> str:
 
 _CN_NUM = {"一": "1", "二": "2", "两": "2", "三": "3", "四": "4", "五": "5"}
 _DISTRICTS = ["海淀", "朝阳", "通州", "昌平", "大兴", "房山", "西城", "丰台", "顺义", "东城"]
-_BEDROOM_RE = re.compile(r"([一二两三四五1-5])\s*居")
-_PRICE_MAX_RE = re.compile(r"(?:租金|预算|月租|价格).*?(\d{3,5})\s*(?:元|块)?(?:以[下内里]|以内|之内|之下)?")
-_PRICE_MAX_RE2 = re.compile(r"(\d{3,5})\s*(?:元|块)?(?:以[下内里]|以内|之内|之下)")
-_PRICE_RANGE_RE = re.compile(r"(\d{3,5})\s*(?:到|至|-|~)\s*(\d{3,5})")
+_BEDROOM_RE = re.compile(r"([一二两三四五1-5])\s*(?:居|室|房)")
+_PRICE_MAX_RE = re.compile(r"(?:租金|预算|月租|价格).*?(\d+(?:k|千)?|\d{3,5})\s*(?:元|块)?(?:以[下内里]|以内|之内|之下)?", re.IGNORECASE)
+_PRICE_MAX_RE2 = re.compile(r"(\d+(?:k|千)?|\d{3,5})\s*(?:元|块)?(?:以[下内里]|以内|之内|之下)", re.IGNORECASE)
+_PRICE_RANGE_RE = re.compile(r"(\d+(?:k|千)?|\d{3,5})\s*(?:到|至|-|~)\s*(\d+(?:k|千)?|\d{3,5})", re.IGNORECASE)
 _AREA_MIN_RE = re.compile(r"(\d{2,3})\s*(?:平|㎡)(?:以上|米以上)?")
 _COMMUTE_RE = re.compile(r"通勤\s*(\d{1,3})\s*分钟")
 _SUBWAY_LINE_RE = re.compile(r"(\d{1,2})号线")
 _SUBWAY_DIST_RE = re.compile(r"(\d{3,4})\s*(?:米|m)(?:以?内)?")
 _PLATFORMS = {"链家": "链家", "安居客": "安居客", "58同城": "58同城", "58": "58同城"}
+# 地标/商圈 -> 行政区，用于无明确区域时的推断
+_LANDMARK_DISTRICT = {"望京南": "朝阳", "望京": "朝阳", "立水桥": "朝阳", "双合站": "朝阳", "金融街": "西城", "西二旗": "海淀", "车公庄": "西城"}
 
 
 def _extract_requirements_summary(messages: list[dict]) -> str | None:
@@ -324,6 +394,8 @@ def _extract_requirements_summary(messages: list[dict]) -> str | None:
     extras = []
     if any(kw in all_text for kw in ["养狗", "养猫", "宠物", "金毛"]):
         extras.append("养宠物")
+    if any(kw in all_text for kw in ["不养宠物", "不养狗", "不养猫", "室友不养"]):
+        extras.append("禁止宠物")
     if any(kw in all_text for kw in ["公园", "遛狗"]):
         extras.append("近公园")
     if any(kw in all_text for kw in ["VR", "线上看房", "不用跑现场"]):
@@ -332,11 +404,37 @@ def _extract_requirements_summary(messages: list[dict]) -> str | None:
         extras.append("月付")
     if any(kw in all_text for kw in ["房东直租", "无中介"]):
         extras.append("房东直租")
+    if any(kw in all_text for kw in ["电梯", "有电梯"]):
+        extras.append("需电梯")
+    if any(kw in all_text for kw in ["民水民电", "民电"]):
+        extras.append("民水民电")
+    if any(kw in all_text for kw in ["租2个月", "租3个月", "短租", "可月租"]):
+        extras.append("短租期")
+    if any(kw in all_text for kw in ["链家", "安居客", "58"]):
+        extras.append("平台偏好")
     if extras:
         parts.append("其他=" + "、".join(extras))
     if not parts:
         return None
     return "当前已确认需求：" + "，".join(parts)
+
+
+def _extract_last_house_ids(messages: list[dict]) -> list[str]:
+    """从对话历史中提取最近一次 assistant 回复的 houses 列表。"""
+    for m in reversed(messages):
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content", "") or ""
+        if not content.strip().startswith("{"):
+            continue
+        try:
+            d = json.loads(content.strip())
+            houses = d.get("houses", [])
+            if isinstance(houses, list) and houses:
+                return [str(h) for h in houses if isinstance(h, str) and h.startswith("HF_")][:5]
+        except json.JSONDecodeError:
+            pass
+    return []
 
 
 def _try_canned_response(msg: str) -> str | None:
@@ -363,12 +461,19 @@ def _try_canned_response(msg: str) -> str | None:
 
 def _try_direct_search(msg: str) -> dict | None:
     """从明确的租房需求中提取参数，直接构建 API 查询参数。"""
-    # 排除：地标/商圈/小区搜索、操作类、多意图（这些需模型用 search_landmarks + get_houses_nearby）
-    if any(kw in msg for kw in ["附近", "上班", "公司", "SOHO", "商圈", "商城", "站", "望京", "国贸", "百度", "车公庄", "小米"]):
-        return None
+    # 排除：操作类、纯地标无区域（附近/上班/公司 等需 get_houses_nearby）
+    # 放宽：含「站」或「望京」时，若同时有行政区(朝阳/海淀等)，仍可走短路
     if any(kw in msg for kw in ["办理", "预约", "退租", "退掉", "下架"]):
         return None
-    if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "推荐", "看看"]):
+    has_district = any(d in msg for d in _DISTRICTS)
+    if not has_district and any(kw in msg for kw in ["附近", "上班", "公司", "SOHO", "商圈", "商城", "国贸", "百度", "小米"]):
+        return None
+    # 2026-03-04 重构：若有明确小区名、大学、地标等，不走短路（交给 nearby/community）
+    # 避免： "我想在望京西园找房" -> 提取 "望京"(朝阳) -> 搜全朝阳 -> 错误
+    if any(kw in msg for kw in ["小区", "园", "里", "寓", "苑", "舍", "家", "村", "大厦", "中心", "广场", "大学", "学院", "医院", "公园"]):
+        # 简单 heuristic: 常见小区后缀
+        return None
+    if not any(kw in msg for kw in ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看"]):
         return None
 
     params: dict[str, Any] = {}
@@ -377,6 +482,11 @@ def _try_direct_search(msg: str) -> dict | None:
         if d in msg:
             params["district"] = d
             break
+    if not params.get("district"):
+        for lm, dist in _LANDMARK_DISTRICT.items():
+            if lm in msg:
+                params["district"] = dist
+                break
 
     bed_match = _BEDROOM_RE.search(msg)
     if bed_match:
@@ -385,12 +495,29 @@ def _try_direct_search(msg: str) -> dict | None:
 
     range_match = _PRICE_RANGE_RE.search(msg)
     if range_match:
-        params["min_price"] = int(range_match.group(1))
-        params["max_price"] = int(range_match.group(2))
+        def _parse_price(s: str) -> int:
+            s = s.lower()
+            if "k" in s:
+                return int(float(s.replace("k", "")) * 1000)
+            if "千" in s:
+                return int(float(s.replace("千", "")) * 1000)
+            return int(s)
+        
+        p1 = _parse_price(range_match.group(1))
+        p2 = _parse_price(range_match.group(2))
+        params["min_price"] = min(p1, p2)
+        params["max_price"] = max(p1, p2)
     else:
         price_match = _PRICE_MAX_RE.search(msg) or _PRICE_MAX_RE2.search(msg)
         if price_match:
-            params["max_price"] = int(price_match.group(1))
+            def _parse_price(s: str) -> int:
+                s = s.lower()
+                if "k" in s:
+                    return int(float(s.replace("k", "")) * 1000)
+                if "千" in s:
+                    return int(float(s.replace("千", "")) * 1000)
+                return int(s)
+            params["max_price"] = _parse_price(price_match.group(1))
 
     area_match = _AREA_MIN_RE.search(msg)
     if area_match:
@@ -409,7 +536,7 @@ def _try_direct_search(msg: str) -> dict | None:
         params["max_subway_dist"] = 800
     elif "地铁可达" in msg:
         params["max_subway_dist"] = 1000
-    elif "离地铁" in msg and subway_dist_match:
+    elif subway_dist_match and ("离地铁" in msg or "米" in msg or "地铁" in msg):
         params["max_subway_dist"] = int(subway_dist_match.group(1))
 
     commute_match = _COMMUTE_RE.search(msg)
@@ -418,7 +545,7 @@ def _try_direct_search(msg: str) -> dict | None:
 
     if "整租" in msg:
         params["rental_type"] = "整租"
-    elif "合租" in msg:
+    elif "合租" in msg or "单间" in msg:
         params["rental_type"] = "合租"
 
     # 平台兼容：链家/58 数据可能为空，不传 listing_platform 避免误判无房
@@ -579,11 +706,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
     tools_schema = get_tools_schema()
     messages = get_messages(session_id)
     
-    # 构建模型消息：系统提示 + 需求摘要（多轮时）+ 压缩历史
+    # 构建模型消息：系统提示 + 需求摘要（多轮时）+ 上一轮候选房源 + 压缩历史
     system_content = SYSTEM_PROMPT
     summary = _extract_requirements_summary(messages)
     if summary and len(messages) >= 2:
         system_content = system_content + f"\n\n[{summary}]"
+    last_house_ids = _extract_last_house_ids(messages)
+    if last_house_ids and len(messages) >= 4:
+        system_content = system_content + f"\n\n[上一轮候选房源：{', '.join(last_house_ids)}。本轮新增条件请在上述房源中筛选，用 get_house_by_id 查详情后过滤，不得重新全量搜索。]"
     model_messages: list[dict] = [{"role": "system", "content": system_content}]
 
     KEEP_RECENT = 18  # 略增历史窗口，减少长对话截断
@@ -628,18 +758,30 @@ async def chat(req: ChatRequest) -> ChatResponse:
         if not tool_calls:
             response_text = content or ""
             service_log.info("[LOOP] session=%s round=%d 模型返回文本(无tool_calls), len=%d", session_id, round_count, len(response_text))
+            # 收集本轮及之前轮次工具返回的有效房源 ID
+            valid_house_ids = set()
+            for tr in tool_results:
+                for hid in _extract_house_ids_from_tool_output(tr.get("output", "") or ""):
+                    valid_house_ids.add(hid)
             # 兜底：若 content 为 tool call 形态（模型误输出），尝试执行；严禁将原始 tool call JSON 返回用户
             parsed = _parse_tool_call_content(response_text)
             if parsed:
                 fallback_result = await _try_execute_tool_call_from_content(response_text, user_id)
                 if fallback_result:
-                    response_text = _ensure_strict_json_response(fallback_result)
+                    try:
+                        fb = json.loads(fallback_result)
+                        for h in fb.get("houses", []):
+                            if isinstance(h, str) and h.startswith("HF_"):
+                                valid_house_ids.add(h)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    response_text = _ensure_strict_json_response(fallback_result, valid_house_ids or None)
                 else:
                     response_text = json.dumps({"message": "查询暂时失败，请稍后重试或调整条件", "houses": []}, ensure_ascii=False)
             elif _looks_like_tool_call(response_text):
                 response_text = json.dumps({"message": "查询暂时失败，请稍后重试或调整条件", "houses": []}, ensure_ascii=False)
             else:
-                response_text = _ensure_strict_json_response(response_text)
+                response_text = _ensure_strict_json_response(response_text, valid_house_ids or None)
             append_messages(session_id, {"role": "assistant", "content": response_text})
             break
 
