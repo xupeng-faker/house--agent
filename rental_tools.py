@@ -207,7 +207,7 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_house_by_id",
-                "description": "查房源详情，含价格、面积、朝向、装修、tags（如仅限小型犬、押一付三、包物业费、房东直租、可短租等）",
+                "description": "查房源详情，含价格、面积、朝向、装修、tags（如仅限小型犬、押一付三、包物业费、房东直租、可短租、仅线下看房、仅工作日看房、线上VR看房等）",
                 "parameters": {
                     "type": "object",
                     "properties": {"house_id": {"type": "string"}},
