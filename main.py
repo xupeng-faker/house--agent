@@ -130,6 +130,17 @@ _SEARCH_TOOLS = frozenset({
 })
 
 
+def _looks_like_tool_call(text: str) -> bool:
+    """检测文本是否形如 tool call JSON，避免将原始格式返回用户。"""
+    if not text or not text.strip():
+        return False
+    try:
+        d = json.loads(text.strip())
+        return isinstance(d, dict) and "name" in d and "arguments" in d
+    except json.JSONDecodeError:
+        return False
+
+
 def _parse_tool_call_content(text: str) -> tuple[str, dict] | None:
     """若 content 形如 {"name":"xxx","arguments":{...}} 则解析，否则返回 None。"""
     if not text or not text.strip():
@@ -147,6 +158,17 @@ def _parse_tool_call_content(text: str) -> tuple[str, dict] | None:
     return None
 
 
+def _has_minimal_search_params(name: str, args: dict) -> bool:
+    """检查是否有最小可执行参数。get_houses_by_platform 仅 district 或 max_price 即可。"""
+    if name == "get_houses_by_platform":
+        return bool(args.get("district") or args.get("area") or args.get("max_price") or args.get("min_price") or args.get("bedrooms"))
+    if name == "get_houses_nearby":
+        return bool(args.get("landmark_id"))
+    if name == "get_houses_by_community":
+        return bool(args.get("community"))
+    return bool(args)
+
+
 async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str | None:
     """尝试将 content 中的 tool call 形态解析并执行，返回格式化结果或 None。"""
     parsed = _parse_tool_call_content(content)
@@ -155,12 +177,12 @@ async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str
     name, args = parsed
     if name not in _SEARCH_TOOLS:
         return None
-    # 过滤非法参数（如 tags）
+    # 过滤非法参数（如 tags），放宽：仅 district 或 max_price 也允许执行
     if name == "get_houses_by_platform":
         args = {k: v for k, v in args.items() if k in _PLATFORM_VALID_KEYS and v is not None}
     else:
         args = {k: v for k, v in args.items() if v is not None}
-    if not args and name in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community"):
+    if not _has_minimal_search_params(name, args):
         return None
     try:
         raw = await run_tool(name, args, user_id)
@@ -276,6 +298,47 @@ _SUBWAY_DIST_RE = re.compile(r"(\d{3,4})\s*(?:米|m)(?:以?内)?")
 _PLATFORMS = {"链家": "链家", "安居客": "安居客", "58同城": "58同城", "58": "58同城"}
 
 
+def _extract_requirements_summary(messages: list[dict]) -> str | None:
+    """从对话历史提取已确认需求，用于多轮上下文继承。"""
+    parts = []
+    all_text = " ".join(m.get("content", "") or "" for m in messages if m.get("role") == "user")
+    for d in _DISTRICTS:
+        if d in all_text:
+            parts.append(f"区域={d}")
+            break
+    range_m = _PRICE_RANGE_RE.search(all_text)
+    if range_m:
+        parts.append(f"预算={range_m.group(1)}-{range_m.group(2)}元")
+    else:
+        price_m = _PRICE_MAX_RE.search(all_text) or _PRICE_MAX_RE2.search(all_text)
+        if price_m:
+            parts.append(f"预算≤{price_m.group(1)}元")
+    bed_match = _BEDROOM_RE.search(all_text)
+    if bed_match:
+        raw = bed_match.group(1)
+        parts.append(f"户型={_CN_NUM.get(raw, raw)}居室")
+    if "整租" in all_text:
+        parts.append("整租")
+    elif "合租" in all_text:
+        parts.append("合租")
+    extras = []
+    if any(kw in all_text for kw in ["养狗", "养猫", "宠物", "金毛"]):
+        extras.append("养宠物")
+    if any(kw in all_text for kw in ["公园", "遛狗"]):
+        extras.append("近公园")
+    if any(kw in all_text for kw in ["VR", "线上看房", "不用跑现场"]):
+        extras.append("线上看房")
+    if any(kw in all_text for kw in ["月付", "押一付一"]):
+        extras.append("月付")
+    if any(kw in all_text for kw in ["房东直租", "无中介"]):
+        extras.append("房东直租")
+    if extras:
+        parts.append("其他=" + "、".join(extras))
+    if not parts:
+        return None
+    return "当前已确认需求：" + "，".join(parts)
+
+
 def _try_canned_response(msg: str) -> str | None:
     """尝试匹配基础对话，返回固定回复或 None。"""
     msg_lower = msg.lower().strip()
@@ -358,8 +421,11 @@ def _try_direct_search(msg: str) -> dict | None:
     elif "合租" in msg:
         params["rental_type"] = "合租"
 
+    # 平台兼容：链家/58 数据可能为空，不传 listing_platform 避免误判无房
     for label, platform in _PLATFORMS.items():
         if label in msg:
+            if platform in ("链家", "58同城"):
+                break  # 不加入 listing_platform，让 API 返回所有平台数据
             params["listing_platform"] = platform
             break
 
@@ -403,33 +469,51 @@ def _try_direct_search(msg: str) -> dict | None:
 
 
 async def _do_direct_search(params: dict, user_id: str) -> str:
-    """直接调用 get_houses_by_platform 并格式化为标准 JSON 输出。"""
+    """直接调用 get_houses_by_platform 并格式化为标准 JSON 输出。链家/58 无数据时自动回退安居客。"""
     raw_out = await run_tool("get_houses_by_platform", params, user_id)
-    
+
     try:
         data = json.loads(raw_out)
     except json.JSONDecodeError:
         service_log.error("[DIRECT] raw_out 非 JSON: %s", raw_out[:500])
         return json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False)
-    
+
     items = _extract_items(data) or []
-    service_log.info("[DIRECT] API返回结构 keys=%s, 提取到 %d 条 items", 
+    did_platform_fallback = False
+    # 平台兼容：链家/58 返回空时，用安居客重试
+    if not items and params.get("listing_platform") in ("链家", "58同城"):
+        retry_params = {k: v for k, v in params.items() if k != "listing_platform"}
+        retry_params["listing_platform"] = "安居客"
+        service_log.info("[DIRECT] 链家/58 无数据，回退安居客重试")
+        raw_out = await run_tool("get_houses_by_platform", retry_params, user_id)
+        try:
+            data = json.loads(raw_out)
+            items = _extract_items(data) or []
+        except json.JSONDecodeError:
+            pass
+        if items:
+            params = retry_params
+            did_platform_fallback = True
+
+    service_log.info("[DIRECT] API返回结构 keys=%s, 提取到 %d 条 items",
                      list(data.keys()) if isinstance(data, dict) else type(data).__name__, len(items))
-    
+
     house_ids = []
     for item in items:
         if isinstance(item, dict):
             hid = item.get("house_id") or item.get("id")
             if hid:
                 house_ids.append(str(hid))
-    
+
     house_ids = house_ids[:5]
-    
+
     if house_ids:
         msg = f"为您找到{len(house_ids)}套符合条件的房源"
+        if did_platform_fallback:
+            msg = "当前为您展示安居客房源。" + msg
     else:
         msg = "暂无符合条件的房源，建议调整筛选条件"
-    
+
     return json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False)
 
 
@@ -495,10 +579,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
     tools_schema = get_tools_schema()
     messages = get_messages(session_id)
     
-    # 构建模型消息：系统提示 + 压缩历史
-    model_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    
-    KEEP_RECENT = 14
+    # 构建模型消息：系统提示 + 需求摘要（多轮时）+ 压缩历史
+    system_content = SYSTEM_PROMPT
+    summary = _extract_requirements_summary(messages)
+    if summary and len(messages) >= 2:
+        system_content = system_content + f"\n\n[{summary}]"
+    model_messages: list[dict] = [{"role": "system", "content": system_content}]
+
+    KEEP_RECENT = 18  # 略增历史窗口，减少长对话截断
     total_msgs = len(messages)
     
     for i, m in enumerate(messages):
@@ -540,13 +628,16 @@ async def chat(req: ChatRequest) -> ChatResponse:
         if not tool_calls:
             response_text = content or ""
             service_log.info("[LOOP] session=%s round=%d 模型返回文本(无tool_calls), len=%d", session_id, round_count, len(response_text))
-            # 兜底：若 content 为 tool call 形态（模型误输出），尝试执行
-            if _parse_tool_call_content(response_text):
+            # 兜底：若 content 为 tool call 形态（模型误输出），尝试执行；严禁将原始 tool call JSON 返回用户
+            parsed = _parse_tool_call_content(response_text)
+            if parsed:
                 fallback_result = await _try_execute_tool_call_from_content(response_text, user_id)
                 if fallback_result:
                     response_text = _ensure_strict_json_response(fallback_result)
                 else:
-                    response_text = json.dumps({"message": "抱歉，请重新描述您的需求", "houses": []}, ensure_ascii=False)
+                    response_text = json.dumps({"message": "查询暂时失败，请稍后重试或调整条件", "houses": []}, ensure_ascii=False)
+            elif _looks_like_tool_call(response_text):
+                response_text = json.dumps({"message": "查询暂时失败，请稍后重试或调整条件", "houses": []}, ensure_ascii=False)
             else:
                 response_text = _ensure_strict_json_response(response_text)
             append_messages(session_id, {"role": "assistant", "content": response_text})

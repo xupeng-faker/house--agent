@@ -248,11 +248,11 @@ def get_tools_schema() -> list[dict]:
             "type": "function",
             "function": {
                 "name": "get_houses_by_platform",
-                "description": "条件查房。params: district, price, bedrooms, subway_dist, commute_to_xierqi_max...",
+                "description": "条件查房。params: district, price, bedrooms, subway_dist, commute_to_xierqi_max... listing_platform 为可选，不传时搜索所有平台；若指定链家/58 无结果，建议不传该参数重试。",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "listing_platform": {"type": "string", "enum": ["链家", "安居客", "58同城"]},
+                        "listing_platform": {"type": "string", "description": "可选，仅在有明确平台需求时传入；链家/58 可能无数据，无结果时可不传重试", "enum": ["链家", "安居客", "58同城"]},
                         "district": {"type": "string"},
                         "area": {"type": "string"},
                         "min_price": {"type": "integer"},
