@@ -1011,4 +1011,5 @@
 2026-03-04 18:18:36 | service   | INFO  | [REQ] session=eval_w30020094_EV-129-3_1772619506542036800 model_ip=7.225.29.223 msg=希望有24小时保安，安全。
 2026-03-04 18:18:36 | service   | INFO  | [INTENT] session=eval_w30020094_EV-129-3_1772619506542036800 turn=5 intent=filter msg=希望有24小时保安，安全。
 2026-03-04 18:18:37 | service   | INFO  | [FILTER_FALLBACK] Re-searching with params: {'page_size': 50, 'district': '朝阳', 'max_price': 5200, 'min_price': 2800}
-2026-03-04 18:18:37 | service   | INFO  | [RESP] session=eval_w30020094_EV-129-3_1772619506542036800 dur=1449ms resp={"message": "暂无完全符合所有条件的房源，建议调整部分筛选条件", "houses": ["HF_65", "HF_67", "HF_97", "HF_111", "HF_147"]}
+2026-03-04 18:18:37 | service   | INFO  | [RESP] session=eval_w30020094_EV-129-3_1772619506542036800 dur=1449ms resp={"message": "暂无完全符合所有条件的房源，建议调整部分筛选条件", "houses": ["HF_65", "HF_67", "HF_97", "HF_111", "HF_147"]}2026-03-04 18:48:27 | service   | INFO  | [FILTER_RELAXED] Trying with relaxed tags: ['可养猫']
+2026-03-04 18:48:27 | service   | INFO  | [FILTER_RELAXED] Returning unfiltered candidates as best-effort

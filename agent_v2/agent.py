@@ -235,11 +235,15 @@ async def handle_message(
             tags_exc = specs.get("tags_exclude", [])
             ff = specs.get("field_filters", [])
 
+            relaxed_msg = False
             if all_ids and (tags_req or tags_exc or ff):
                 from filters import filter_candidates
                 matched, _ = await filter_candidates(all_ids[:20], tags_req, tags_exc, ff, user_id)
                 if matched:
                     top5 = matched[:5]
+                else:
+                    top5 = all_ids[:5]
+                    relaxed_msg = True
 
             # Also filter by params (bedrooms, price, rental_type, decoration)
             if all_ids and params:
@@ -247,10 +251,16 @@ async def handle_message(
                 if filtered:
                     top5 = filtered[:5]
                     all_ids = filtered
+                else:
+                    top5 = all_ids[:5] if all_ids else top5
+                    relaxed_msg = True
 
             sess.all_results = all_ids
             sess.candidates = top5
-            msg = f"为您找到{len(top5)}套{lm_name}附近房源" if top5 else f"暂未找到{lm_name}附近在租房源"
+            if top5:
+                msg = "未找到完全符合的房源，为您推荐以下备选" if relaxed_msg else f"为您找到{len(top5)}套{lm_name}附近房源"
+            else:
+                msg = f"暂未找到{lm_name}附近在租房源"
             resp = _resp_json(msg, top5)
             sess.append_msg({"role": "assistant", "content": resp})
             return resp, [{"name": "get_houses_nearby", "success": bool(top5), "output": resp}]
@@ -280,13 +290,17 @@ async def handle_message(
         all_tags_exc = sess.requirements.get("tags_exclude", [])
         all_ff = sess.requirements.get("field_filters", [])
 
-        matched, tr = await filter_with_fallback(
+        # Ensure all_results has a pool for filter steps (Fix 7)
+        if not sess.all_results and sess.candidates:
+            sess.all_results = sess.candidates
+
+        matched, tr, was_relaxed = await filter_with_fallback(
             sess, all_tags_req, all_tags_exc, all_ff, user_id,
             current_turn_tags=tags_req or None,
         )
         if matched:
             sess.candidates = matched[:5]
-            msg = f"已为您筛选出{len(matched)}套符合条件的房源"
+            msg = "已放宽筛选，为您推荐以下房源" if was_relaxed else f"已为您筛选出{len(matched)}套符合条件的房源"
             resp = _resp_json(msg, matched[:5])
         else:
             msg = "暂无完全符合所有条件的房源，建议调整部分筛选条件"
@@ -334,16 +348,23 @@ async def handle_message(
         all_tags_req = sess.requirements.get("tags_require", [])
         all_tags_exc = sess.requirements.get("tags_exclude", [])
         all_ff = sess.requirements.get("field_filters", [])
+        relaxed_msg = False
         if all_ids and (all_tags_req or all_tags_exc or all_ff):
             from filters import filter_candidates
             matched, _ = await filter_candidates(all_ids[:30], all_tags_req, all_tags_exc, all_ff, user_id)
             if matched:
                 top5 = matched[:5]
                 all_ids = matched + [i for i in all_ids if i not in matched]
+            else:
+                top5 = all_ids[:5]
+                relaxed_msg = True
 
         sess.all_results = all_ids
         sess.candidates = top5
-        msg = f"为您找到{len(top5)}套符合条件的房源" if top5 else "暂无符合条件的房源，建议调整筛选条件"
+        if top5:
+            msg = "未找到完全符合的房源，为您推荐以下备选" if relaxed_msg else f"为您找到{len(top5)}套符合条件的房源"
+        else:
+            msg = "暂无符合条件的房源，建议调整筛选条件"
         resp = _resp_json(msg, top5)
         sess.append_msg({"role": "assistant", "content": resp})
         return resp, [{"name": "search", "success": bool(top5), "output": resp}]

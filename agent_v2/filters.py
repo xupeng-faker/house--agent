@@ -107,14 +107,14 @@ async def filter_with_fallback(
     field_filters: list[tuple[str, str, Any]],
     user_id: str,
     current_turn_tags: list[str] | None = None,
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str], list[dict], bool]:
     """Multi-turn filter with fallback:
     1. Filter current candidates with ALL accumulated conditions
-    2. If empty, filter all_results (up to 50)
+    2. If empty, filter all_results (up to 20)
     3. If still empty, re-search with accumulated params and filter
-    4. If still empty, relaxed: only apply current turn's tags on all_results
+    4. If still empty, relaxed: only apply current/last turn's tags
     5. Last resort: return existing results unfiltered
-    Returns (matched_ids, tool_results)."""
+    Returns (matched_ids, tool_results, was_relaxed)."""
 
     # Step 1: filter current candidates
     if sess.candidates:
@@ -122,16 +122,16 @@ async def filter_with_fallback(
             sess.candidates, tags_require, tags_exclude, field_filters, user_id
         )
         if matched:
-            return matched[:5], tr
+            return matched[:5], tr, False
 
-    # Step 2: filter broader result set
-    broader = [hid for hid in sess.all_results if hid not in sess.candidates]
-    if broader:
+    # Step 2: filter all_results (including when broader would be empty)
+    pool = sess.all_results or sess.candidates
+    if pool:
         matched2, tr2 = await filter_candidates(
-            broader[:20], tags_require, tags_exclude, field_filters, user_id
+            pool[:20], tags_require, tags_exclude, field_filters, user_id
         )
         if matched2:
-            return matched2[:5], tr2
+            return matched2[:5], tr2, False
 
     # Step 3: re-search with accumulated params (tags applied post-fetch)
     params = sess.build_search_params()
@@ -146,27 +146,26 @@ async def filter_with_fallback(
                     all_ids[:30], tags_require, tags_exclude, field_filters, user_id
                 )
                 if matched3:
-                    return matched3[:5], tr3
+                    return matched3[:5], tr3, False
         except Exception as e:
             log.warning("[FILTER_FALLBACK] Re-search failed: %s", e)
 
-    # Step 4: relaxed -- only use current turn's tags (not all accumulated)
-    if current_turn_tags and len(tags_require) > len(current_turn_tags):
-        pool = sess.all_results or sess.candidates
-        if pool:
-            log.info("[FILTER_RELAXED] Trying with only current-turn tags: %s", current_turn_tags)
-            matched4, tr4 = await filter_candidates(
-                pool[:30], current_turn_tags, tags_exclude, field_filters, user_id
-            )
-            if matched4:
-                return matched4[:5], tr4
+    # Step 4: relaxed -- use current turn's tags or last added tag(s)
+    relaxed_tags = current_turn_tags or (tags_require[-1:] if tags_require else [])
+    if relaxed_tags and pool:
+        log.info("[FILTER_RELAXED] Trying with relaxed tags: %s", relaxed_tags)
+        matched4, tr4 = await filter_candidates(
+            pool[:30], relaxed_tags, tags_exclude, field_filters, user_id
+        )
+        if matched4:
+            return matched4[:5], tr4, True
 
     # Step 5: last resort -- return existing results unfiltered
     if sess.all_results:
         log.info("[FILTER_RELAXED] Returning unfiltered candidates as best-effort")
-        return sess.all_results[:5], []
+        return sess.all_results[:5], [], True
 
-    return [], []
+    return [], [], False
 
 
 async def do_search(params: dict[str, Any], user_id: str) -> tuple[str, list[str], list[str]]:
@@ -179,8 +178,8 @@ async def do_search(params: dict[str, Any], user_id: str) -> tuple[str, list[str
     raw = await run_tool("get_houses_by_platform", params, user_id)
     all_ids = extract_house_ids(raw)
 
-    # Platform fallback: if 链家/58同城 returns empty, try 安居客
-    if not all_ids and params.get("listing_platform") in ("链家", "58同城"):
+    # Platform fallback: when any platform returns empty, try 安居客
+    if not all_ids and params.get("listing_platform"):
         retry = {k: v for k, v in params.items() if k != "listing_platform"}
         retry["listing_platform"] = "安居客"
         log.info("[SEARCH] Platform fallback to 安居客")

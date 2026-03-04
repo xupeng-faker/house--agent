@@ -119,11 +119,15 @@ def extract_items(data: Any) -> list:
         return []
     if "items" in data and isinstance(data["items"], list):
         return data["items"]
+    if "houses" in data and isinstance(data["houses"], list):
+        return data["houses"]
     inner = data.get("data")
     if isinstance(inner, list):
         return inner
     if isinstance(inner, dict) and isinstance(inner.get("items"), list):
         return inner["items"]
+    if isinstance(inner, dict) and isinstance(inner.get("houses"), list):
+        return inner["houses"]
     return []
 
 
