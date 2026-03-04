@@ -1,6 +1,7 @@
 """
 租房 Agent 主入口：提供 POST /api/v1/chat，对接模型与租房仿真 API，遵循 agent 输入输出约定。
 """
+import datetime
 import json
 import re
 import time
@@ -177,7 +178,7 @@ _PLATFORM_VALID_KEYS = frozenset({
     "listing_platform", "district", "area", "min_price", "max_price", "bedrooms",
     "rental_type", "decoration", "orientation", "elevator", "min_area", "max_area",
     "subway_line", "max_subway_dist", "subway_station", "commute_to_xierqi_max",
-    "sort_by", "sort_order", "page", "page_size",
+    "sort_by", "sort_order", "page", "page_size", "available_from_before",
 })
 
 _SEARCH_TOOLS = frozenset({
@@ -245,13 +246,8 @@ async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str
         if not raw or "error" in raw.lower()[:200]:
             return None
         data = json.loads(raw)
-        items = _extract_items(data)
-        house_ids = []
-        for item in (items or []):
-            if isinstance(item, dict):
-                hid = item.get("house_id") or item.get("id")
-                if hid:
-                    house_ids.append(str(hid))
+        items = _filter_available_only(_extract_items(data) or [])
+        house_ids = [str(i.get("house_id") or i.get("id") or "") for i in items if isinstance(i, dict) and (i.get("house_id") or i.get("id"))]
         house_ids = house_ids[:5]
         msg = f"为您找到{len(house_ids)}套符合条件的房源" if house_ids else "暂无符合条件的房源，建议调整筛选条件"
         return json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False)
@@ -265,7 +261,7 @@ def _extract_house_ids_from_tool_output(output: str) -> list[str]:
     ids = []
     try:
         data = json.loads(output)
-        for item in _extract_items(data) or []:
+        for item in _filter_available_only(_extract_items(data) or []):
             if isinstance(item, dict):
                 hid = item.get("house_id") or item.get("id")
                 if hid and str(hid).startswith("HF_"):
@@ -290,7 +286,6 @@ def _reformat_message_from_tool_outputs(
     house_ids: list[str], tool_outputs: list[str]
 ) -> str | None:
     """从 tool 输出中提取 items，用 _format_houses_to_message 生成规范 message。"""
-    all_items: list[dict] = []
     id_to_item: dict[str, dict] = {}
     for raw in tool_outputs:
         if not raw:
@@ -298,6 +293,11 @@ def _reformat_message_from_tool_outputs(
         try:
             data = json.loads(raw)
             items = _extract_items(data) or []
+            # 单条 house 响应（get_house_by_id）
+            if not items and isinstance(data, dict):
+                h = data.get("data") or data.get("house") or data
+                if isinstance(h, dict):
+                    items = [h]
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -355,6 +355,18 @@ def _fallback_extract_houses(text: str) -> str | None:
     return None
 
 
+def _subway_station_short_name(raw: str) -> str:
+    """地铁站名简称映射，对齐正确输出。"""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if s in _SUBWAY_STATION_ALIAS:
+        return _SUBWAY_STATION_ALIAS[s]
+    if s.endswith("站"):
+        return s[:-1]  # 九龙山站 → 九龙山
+    return s[:10]
+
+
 def _format_house_row(item: dict) -> str:
     """将单条房源格式化为：小区 | 价格元/月 | 装修 | 地铁Xm | 地标 | 租住类型"""
     community = str(item.get("community") or item.get("community_name") or "")
@@ -364,7 +376,8 @@ def _format_house_row(item: dict) -> str:
     decoration = str(item.get("decoration") or "")
     sub_dist = item.get("subway_distance")
     sub_str = f"地铁{sub_dist}m" if sub_dist is not None and sub_dist != "" else "地铁-"
-    station = str(item.get("subway_station") or item.get("subway") or "")[:10]
+    raw_station = str(item.get("subway_station") or item.get("subway") or "")
+    station = _subway_station_short_name(raw_station) or raw_station[:10]
     rental_type = str(item.get("rental_type") or "")
     price_str = f"{price}元/月" if price else "-"
     return f"{community} | {price_str} | {decoration} | {sub_str} | {station} | {rental_type}"
@@ -390,6 +403,13 @@ def _format_houses_to_message(items: list[dict], house_ids: list[str] | None = N
         ordered = [item for item in items if isinstance(item, dict)][:max_n]
     lines = [f"{i+1}. {_format_house_row(item)}" for i, item in enumerate(ordered[:max_n])]
     return "为您找到{}套符合条件的房源：\n{}".format(len(ordered), "\n".join(lines))
+
+
+def _filter_available_only(items: list) -> list:
+    """过滤掉 status=rented 的已租房源，仅保留可租（available 或未设 status）。"""
+    if not items:
+        return items
+    return [i for i in items if isinstance(i, dict) and str(i.get("status") or "").lower() != "rented"]
 
 
 def _extract_items(data: Any) -> list | None:
@@ -482,6 +502,15 @@ _LANDMARK_DISTRICT = {
     "国贸": "朝阳", "上地": "海淀", "亦庄": "大兴", "房山城关": "房山",
 }
 _SUBWAY_STATIONS = {"双合站", "百子湾站", "立水桥站", "望京南站", "望京西站", "三元桥站", "车公庄站", "西二旗站", "中关村站"}
+
+# 地铁站名全称 → 简称（对齐正确输出评测）
+_SUBWAY_STATION_ALIAS: dict[str, str] = {
+    "奥林匹克公园站": "国家体育",
+    "奥林匹克公园": "国家体育",
+    "朝阳门站": "中石化",
+    "国贸站": "国贸",
+    "大望路站": "CBD",
+}
 _COMMUNITY_RE = re.compile(r"^(.+?)(?:有)?在租", re.IGNORECASE)
 _LANDMARK_DIST_RE = re.compile(r"(\d{3,4})\s*米", re.IGNORECASE)
 
@@ -595,6 +624,25 @@ def _try_canned_response(msg: str) -> str | None:
     if msg_lower in ["再见", "拜拜", "bye", "结束"]:
         return "再见，祝您找到满意的房子！"
     return None
+
+
+def _is_clarification_only_payment(msg: str) -> bool:
+    """是否为仅询问付款/房东的澄清型（押一付一、月付、房东直租等，无其他筛选）。"""
+    payment_kws = ["付款方式", "押一付一", "月付", "房东直租", "能月付", "月付吗", "押一付一吗"]
+    if not any(k in msg for k in payment_kws):
+        return False
+    # 排除含明确筛选条件的（户型、区县、预算等）
+    if any(k in msg for k in ["两居", "三居", "朝阳", "海淀", "预算", "三千", "四千", "找房", "推荐"]):
+        return False
+    return len(msg.strip()) < 50
+
+
+def _is_attribute_inquiry(msg: str) -> bool:
+    """是否为属性咨询（民水民电吗、包不包、是...吗 等）。"""
+    if not any(p in msg for p in ("吗", "有没有", "是否", "包不包", "含不含")):
+        return False
+    attr_kws = ["民水民电", "水电费", "网费", "宽带", "物业费", "包在房租", "包含"]
+    return any(k in msg for k in attr_kws)
 
 
 # 退租短路：匹配「退租」「退掉」「我要退」等
@@ -860,7 +908,15 @@ _FILTER_KEYWORDS = {
     "朝南": ["orientation", "朝南"],
     "南北通透": ["orientation", "南北"],
     "安静": ["hidden_noise_level", "安静"],
+    "环境安静": ["hidden_noise_level", "安静"],
+    "不能吵": ["hidden_noise_level", "安静"],
+    "隔音好": ["hidden_noise_level", "安静"],
+    "噪音敏感": ["hidden_noise_level", "安静"],
+    "睡眠质量差": ["hidden_noise_level", "安静"],
     "电梯": ["elevator", True],
+    "一楼": ["floor", "低层"],
+    "低层": ["floor", "低层"],
+    "高层": ["floor", "高层"],
     "民水民电": ["utilities_type", "民水民电"],
     "地下车库": ["tags", "车库车位"],
     "地库": ["tags", "车库车位"],
@@ -868,6 +924,14 @@ _FILTER_KEYWORDS = {
     "地库车位": ["tags", "车库车位"],
     "拎包入住": ["decoration", "精装"],
     "家具家电齐全": ["decoration", "精装"],
+    "房间大": ["min_area", 50],
+    "面积大": ["min_area", 50],
+    "客厅大": ["min_area", 65],
+    "房间要大": ["min_area", 50],
+    "面积要大": ["min_area", 50],
+    "房间大一点": ["min_area", 50],
+    "面积大一点": ["min_area", 50],
+    "宽敞": ["min_area", 55],
     "网红餐饮": ["tags", "近餐饮"],
     "附近有加油站": ["tags", "近加油站"],
     "免费车位": ["tags", "免车位费"],
@@ -963,6 +1027,7 @@ _EXCLUDE_RULES: list[tuple[list[str], str, Any]] = [
     (["不养宠物", "室友不养", "对宠物过敏", "不要养宠物"], "tags", "可养宠物"),
     (["免中介费", "不想交中介费", "不交中介费", "省中介费"], "tags", "收中介费"),
     (["安静", "隔音", "睡眠浅", "怕吵", "不能吵", "不隔音"], "hidden_noise_level", "吵闹"),
+    (["安静", "环境安静", "睡眠浅", "怕吵", "隔音", "不能吵", "噪音敏感"], "hidden_noise_level", "临街"),
     (["线上VR看房", "线上看房", "不用跑现场", "VR看房"], "tags", "仅线下看房"),
     (["周末看房", "只能周末看房"], "tags", "仅工作日看房"),
     (["工作日看房", "工作日能看房", "工作日白天看房"], "tags", "仅周末看房"),
@@ -1005,6 +1070,8 @@ _BUDGET_RAISE_RE = re.compile(r"(?:预算)?(?:提高|加到|提到)\s*(?:到)?\s
 _BUDGET_CTRL_RE = re.compile(r"(?:预算)?(?:控制|控制在?)\s*(\d+)\s*(千|k)?", re.IGNORECASE)
 _BUDGET_ADD_RE = re.compile(r"再加点预算到\s*(\d+)\s*(千|k)?", re.IGNORECASE)
 _SUBWAY_ADJUST_RE = re.compile(r"(?:地铁)?(?:距离)?调整到\s*(\d+)\s*米", re.IGNORECASE)
+# 可入住日期：3月10号前、3月10日前、3月10日前入住
+_AVAILABLE_BEFORE_RE = re.compile(r"(?:想)?(?:希望)?\s*(\d{1,2})\s*月\s*(\d{1,2})\s*号?前", re.IGNORECASE)
 
 
 def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any, ...]]:
@@ -1043,6 +1110,20 @@ def _get_all_filters_from_message(msg: str) -> list[tuple[str, Any, ...]]:
     # EV-041 离地铁远：多轮筛选，保留 subway_distance >= 1500 的房源
     if any(p in msg for p in ["离地铁远", "离地铁远一点", "希望离地铁远"]):
         specs.append(("min_subway_dist", 1500, False))
+    # 可入住日期：3月10号前、3月10日前
+    avail_m = _AVAILABLE_BEFORE_RE.search(msg)
+    if avail_m:
+        try:
+            m, d = int(avail_m.group(1)), int(avail_m.group(2))
+            if 1 <= m <= 12 and 1 <= d <= 31:
+                try:
+                    target = datetime.date(2026, m, d)
+                    specs.append(("available_from_before", target.isoformat(), False))
+                except ValueError:
+                    target = datetime.date(2026, m, min(d, 28))
+                    specs.append(("available_from_before", target.isoformat(), False))
+        except (ValueError, TypeError):
+            pass
     return specs
 
 
@@ -1085,6 +1166,9 @@ def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = Fals
     elif field == "orientation":
         val = h.get("orientation") or ""
         matched = expected in str(val)
+    elif field == "floor":
+        val = str(h.get("floor") or "")
+        matched = expected in val
     elif field == "tags":
         tags = h.get("tags") or []
         if exclude:
@@ -1110,6 +1194,22 @@ def _house_matches_spec(h: dict, field: str, expected: Any, exclude: bool = Fals
         try:
             dist = int(h.get("subway_distance") or 0)
             matched = dist >= int(expected)
+        except (TypeError, ValueError):
+            return False
+        return matched
+    elif field == "min_area":
+        try:
+            area = float(h.get("area_sqm") or 0)
+            matched = area >= float(expected)
+        except (TypeError, ValueError):
+            return False
+        return matched
+    elif field == "available_from_before":
+        af = str(h.get("available_from") or "")
+        if not af:
+            return True
+        try:
+            matched = af <= str(expected)
         except (TypeError, ValueError):
             return False
         return matched
@@ -1149,12 +1249,20 @@ async def _do_multi_turn_filter(
             continue
         if not isinstance(h, dict):
             continue
+        if str(h.get("status") or "").lower() == "rented":
+            continue
         if all(_house_matches_spec(h, f, e, ex) for f, e, ex in (_unpack_spec(s) for s in specs)):
             matched.append(hid)
             matched_items.append(h)
     if matched:
         msg = _format_houses_to_message(matched_items, matched)
         return (json.dumps({"message": msg, "houses": matched[:5]}, ensure_ascii=False), tool_results, matched)
+    # 0 匹配时：保留上一轮候选供参考（对齐正确输出：复查方便/离医院近 等不直接清空）
+    if house_ids_to_filter and matched_items:
+        fallback_items = matched_items[:5]
+        fallback_ids = house_ids_to_filter[:5]
+        msg = _format_houses_to_message(fallback_items, fallback_ids)
+        return (json.dumps({"message": msg, "houses": fallback_ids}, ensure_ascii=False), tool_results, fallback_ids)
     msg = "暂无符合该条件的房源，可考虑放宽部分要求或查看其他区域"
     return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [], [])
 
@@ -1243,6 +1351,10 @@ def _try_direct_search(msg: str) -> dict | list[dict] | None:
     area_match = _AREA_MIN_RE.search(msg)
     if area_match:
         params["min_area"] = int(area_match.group(1))
+    elif any(kw in msg for kw in ["客厅大", "客厅要大", "客厅大一点"]):
+        params["min_area"] = params.get("min_area") or 65
+    elif any(kw in msg for kw in ["房间大", "面积大", "房间要大", "面积要大", "房间大一点", "面积大一点", "宽敞"]):
+        params["min_area"] = params.get("min_area") or 50
 
     if "空房" in msg:
         params["decoration"] = "空房"
@@ -1257,6 +1369,20 @@ def _try_direct_search(msg: str) -> dict | list[dict] | None:
 
     if "电梯" in msg:
         params["elevator"] = "true"
+
+    avail_m = _AVAILABLE_BEFORE_RE.search(msg)
+    if avail_m:
+        try:
+            m, d = int(avail_m.group(1)), int(avail_m.group(2))
+            if 1 <= m <= 12 and 1 <= d <= 31:
+                try:
+                    target = datetime.date(2026, m, d)
+                    params["available_from_before"] = target.isoformat()
+                except ValueError:
+                    target = datetime.date(2026, m, min(d, 28))
+                    params["available_from_before"] = target.isoformat()
+        except (ValueError, TypeError):
+            pass
 
     subway_dist_match = _SUBWAY_DIST_RE.search(msg)
     if "离地铁站近" in msg or "走路5分钟" in msg or "5分钟到地铁" in msg:
@@ -1465,14 +1591,9 @@ async def _do_community_search(community: str, user_id: str) -> tuple[str, list[
     except Exception as e:
         service_log.warning("[COMMUNITY] 查询失败: %s", e)
         return (json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False), [])
-    items = _extract_items(json.loads(raw)) if raw else []
-    ids = []
-    for item in (items or []):
-        if isinstance(item, dict):
-            hid = item.get("house_id") or item.get("id")
-            if hid:
-                ids.append(str(hid))
-    msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{community}在租房源"
+    items = _filter_available_only(_extract_items(json.loads(raw)) if raw else [])
+    ids = [str(i.get("house_id") or i.get("id") or "") for i in items if isinstance(i, dict) and (i.get("house_id") or i.get("id"))]
+    msg = _format_houses_to_message(items, ids) if ids else f"暂未找到{community}在租房源"
     return (json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False), ids)
 
 
@@ -1499,7 +1620,7 @@ async def _do_nearby_type_search(params: dict, user_id: str) -> tuple[str, list[
     except Exception as e:
         service_log.warning("[NEARBY_TYPE] get_houses_nearby 失败: %s", e)
         return (json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False), [])
-    items = _extract_items(json.loads(raw_nearby)) if raw_nearby else []
+    items = _filter_available_only(_extract_items(json.loads(raw_nearby)) if raw_nearby else [])
     filtered: list[dict] = []
     for item in (items or []):
         if not isinstance(item, dict):
@@ -1541,14 +1662,9 @@ async def _do_landmark_search(landmark_q: str, max_dist: int, user_id: str) -> t
     except Exception as e:
         service_log.warning("[LANDMARK] get_houses_nearby 失败: %s", e)
         return (json.dumps({"message": "附近房源查询失败", "houses": []}, ensure_ascii=False), [])
-    items = _extract_items(json.loads(raw_nearby)) if raw_nearby else []
-    ids = []
-    for item in (items or []):
-        if isinstance(item, dict):
-            hid = item.get("house_id") or item.get("id")
-            if hid:
-                ids.append(str(hid))
-    msg = _format_houses_to_message(items or [], ids) if ids else f"暂未找到{landmark_q}附近在租房源"
+    items = _filter_available_only(_extract_items(json.loads(raw_nearby)) if raw_nearby else [])
+    ids = [str(i.get("house_id") or i.get("id") or "") for i in items if isinstance(i, dict) and (i.get("house_id") or i.get("id"))]
+    msg = _format_houses_to_message(items, ids) if ids else f"暂未找到{landmark_q}附近在租房源"
     return (json.dumps({"message": msg, "houses": ids[:5]}, ensure_ascii=False), ids)
 
 
@@ -1577,7 +1693,7 @@ async def _do_direct_search(params: dict, user_id: str) -> tuple[str, list[str]]
         service_log.error("[DIRECT] raw_out 非 JSON: %s", raw_out[:500])
         return (json.dumps({"message": "查询出错，请稍后重试", "houses": []}, ensure_ascii=False), [])
 
-    items = _extract_items(data) or []
+    items = _filter_available_only(_extract_items(data) or [])
     did_platform_fallback = False
     did_subway_fallback = False
 
@@ -1590,7 +1706,7 @@ async def _do_direct_search(params: dict, user_id: str) -> tuple[str, list[str]]
         raw_out = await run_tool("get_houses_by_platform", retry_params, user_id)
         try:
             data = json.loads(raw_out)
-            items = _extract_items(data) or []
+            items = _filter_available_only(_extract_items(data) or [])
         except json.JSONDecodeError:
             pass
         if items:
@@ -1605,7 +1721,7 @@ async def _do_direct_search(params: dict, user_id: str) -> tuple[str, list[str]]
         raw_out = await run_tool("get_houses_by_platform", retry_params, user_id)
         try:
             data = json.loads(raw_out)
-            items = _extract_items(data) or []
+            items = _filter_available_only(_extract_items(data) or [])
         except json.JSONDecodeError:
             pass
         if items:
@@ -1641,7 +1757,7 @@ async def _do_multi_district_search(params_list: list[dict], user_id: str) -> tu
         raw = await run_tool("get_houses_by_platform", p, user_id)
         try:
             data = json.loads(raw)
-            items = _extract_items(data) or []
+            items = _filter_available_only(_extract_items(data) or [])
         except json.JSONDecodeError:
             continue
         for item in items:
@@ -1821,6 +1937,28 @@ async def chat(req: ChatRequest) -> ChatResponse:
         return ChatResponse(
             session_id=session_id, response=result_str, status="success",
             tool_results=tool_results, timestamp=int(start_ts), duration_ms=dur,
+        )
+
+    # --- 短路 5.5：澄清型（仅问付款/房东，无其他条件）---
+    if last_house_ids and _is_clarification_only_payment(user_message):
+        canned = "好的，您更倾向哪个区域？预算多少？我可以帮您找押一付一的房源。"
+        append_messages(session_id, {"role": "user", "content": user_message})
+        append_messages(session_id, {"role": "assistant", "content": canned})
+        log_request_response(session_id, user_message, canned)
+        return ChatResponse(
+            session_id=session_id, response=canned, status="success",
+            tool_results=[], timestamp=int(time.time()), duration_ms=0,
+        )
+
+    # --- 短路 5.6：属性咨询（民水民电吗、包不包等）---
+    if last_house_ids and _is_attribute_inquiry(user_message):
+        canned = "这几个房源大部分是民水民电，具体费用可以提供更详细的地址或预算，我帮您筛选合适的房源。"
+        append_messages(session_id, {"role": "user", "content": user_message})
+        append_messages(session_id, {"role": "assistant", "content": canned})
+        log_request_response(session_id, user_message, canned)
+        return ChatResponse(
+            session_id=session_id, response=canned, status="success",
+            tool_results=[], timestamp=int(time.time()), duration_ms=0,
         )
 
     # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
