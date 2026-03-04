@@ -1,6 +1,0 @@
-2026-03-04 18:48:27 | tool      | INFO  | [CALL] tool=get_house_by_id args={"house_id": "HF_1"}
-2026-03-04 18:48:27 | tool      | ERROR | [ERROR] tool=get_house_by_id dur=50ms err=All connection attempts failed
-2026-03-04 18:48:27 | tool      | INFO  | [CALL] tool=get_house_by_id args={"house_id": "HF_1"}
-2026-03-04 18:48:27 | tool      | ERROR | [ERROR] tool=get_house_by_id dur=0ms err=All connection attempts failed
-2026-03-04 18:48:27 | tool      | INFO  | [CALL] tool=get_house_by_id args={"house_id": "HF_1"}
-2026-03-04 18:48:27 | tool      | ERROR | [ERROR] tool=get_house_by_id dur=0ms err=All connection attempts failed
