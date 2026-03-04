@@ -50,11 +50,9 @@ class Session:
                         existing.append(f)
                 self.requirements["field_filters"] = existing
             elif k == "max_price" and v is not None:
-                old = self.requirements.get("max_price")
-                self.requirements["max_price"] = v if old is None else min(old, v)
+                self.requirements["max_price"] = v
             elif k == "min_price" and v is not None:
-                old = self.requirements.get("min_price")
-                self.requirements["min_price"] = v if old is None else max(old, v)
+                self.requirements["min_price"] = v
             else:
                 self.requirements[k] = v
 

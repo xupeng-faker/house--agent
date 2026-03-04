@@ -106,11 +106,14 @@ async def filter_with_fallback(
     tags_exclude: list[str],
     field_filters: list[tuple[str, str, Any]],
     user_id: str,
+    current_turn_tags: list[str] | None = None,
 ) -> tuple[list[str], list[dict]]:
     """Multi-turn filter with fallback:
-    1. Filter current candidates (top 5)
+    1. Filter current candidates with ALL accumulated conditions
     2. If empty, filter all_results (up to 50)
     3. If still empty, re-search with accumulated params and filter
+    4. If still empty, relaxed: only apply current turn's tags on all_results
+    5. Last resort: return existing results unfiltered
     Returns (matched_ids, tool_results)."""
 
     # Step 1: filter current candidates
@@ -130,7 +133,7 @@ async def filter_with_fallback(
         if matched2:
             return matched2[:5], tr2
 
-    # Step 3: re-search with accumulated params
+    # Step 3: re-search with accumulated params (tags applied post-fetch)
     params = sess.build_search_params()
     if params.get("district") or params.get("area"):
         log.info("[FILTER_FALLBACK] Re-searching with params: %s", params)
@@ -146,6 +149,22 @@ async def filter_with_fallback(
                     return matched3[:5], tr3
         except Exception as e:
             log.warning("[FILTER_FALLBACK] Re-search failed: %s", e)
+
+    # Step 4: relaxed -- only use current turn's tags (not all accumulated)
+    if current_turn_tags and len(tags_require) > len(current_turn_tags):
+        pool = sess.all_results or sess.candidates
+        if pool:
+            log.info("[FILTER_RELAXED] Trying with only current-turn tags: %s", current_turn_tags)
+            matched4, tr4 = await filter_candidates(
+                pool[:30], current_turn_tags, tags_exclude, field_filters, user_id
+            )
+            if matched4:
+                return matched4[:5], tr4
+
+    # Step 5: last resort -- return existing results unfiltered
+    if sess.all_results:
+        log.info("[FILTER_RELAXED] Returning unfiltered candidates as best-effort")
+        return sess.all_results[:5], []
 
     return [], []
 

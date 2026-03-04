@@ -280,13 +280,15 @@ async def handle_message(
         all_tags_exc = sess.requirements.get("tags_exclude", [])
         all_ff = sess.requirements.get("field_filters", [])
 
-        matched, tr = await filter_with_fallback(sess, all_tags_req, all_tags_exc, all_ff, user_id)
+        matched, tr = await filter_with_fallback(
+            sess, all_tags_req, all_tags_exc, all_ff, user_id,
+            current_turn_tags=tags_req or None,
+        )
         if matched:
             sess.candidates = matched[:5]
             msg = f"已为您筛选出{len(matched)}套符合条件的房源"
             resp = _resp_json(msg, matched[:5])
         else:
-            # Keep old candidates but inform user
             msg = "暂无完全符合所有条件的房源，建议调整部分筛选条件"
             resp = _resp_json(msg, sess.candidates[:5])
 
@@ -319,8 +321,13 @@ async def handle_message(
         else:
             search_params = sess.build_search_params()
             if not search_params.get("district") and not search_params.get("area"):
-                # No district -- fall through to LLM
-                return await _llm_fallback(sess, user_message, model_ip, user_id)
+                # Try to infer district from session history before falling to LLM
+                sess_district = sess.requirements.get("district")
+                if sess_district:
+                    search_params["district"] = sess_district
+                    log.info("[SEARCH] Inferred district=%s from session", sess_district)
+                else:
+                    return await _llm_fallback(sess, user_message, model_ip, user_id)
             _, all_ids, top5 = await do_search(search_params, user_id)
 
         # Post-filter by accumulated tags if any
@@ -427,7 +434,7 @@ async def _llm_fallback(
     tool_results: list[dict] = []
     valid_ids: set[str] = set()
     response_text = ""
-    max_rounds = 5
+    max_rounds = 3
 
     for round_num in range(1, max_rounds + 1):
         tools_schema = get_tools_schema(round_num=round_num)

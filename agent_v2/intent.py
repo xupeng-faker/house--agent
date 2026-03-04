@@ -51,10 +51,12 @@ LANDMARK_KEYWORDS = {
 # ── Regex patterns ─────────────────────────────────────────────────────
 
 _BEDROOM_RE = re.compile(r"([一二两三四五1-5])\s*(?:居|室|房)")
-_PRICE_RANGE_RE = re.compile(r"(\d+(?:k|千)?)\s*(?:到|至|-|~)\s*(\d+(?:k|千)?)", re.I)
+_PRICE_RANGE_RE = re.compile(
+    r"(\d+(?:k|千)?)\s*(?:到|至|-|~)\s*(\d+(?:k|千)?)(?!点|号|日|月|时|分|秒|层|楼|岁|年|期)", re.I
+)
 _PRICE_MAX_RE = re.compile(r"(?:租金|预算|月租|价格|房租).*?(\d+(?:k|千)?)\s*(?:元|块)?(?:以[下内里]|以内|之内)?", re.I)
 _PRICE_MAX_RE2 = re.compile(r"(\d+(?:k|千)?)\s*(?:元|块)?(?:以[下内里]|以内|之内)", re.I)
-_PRICE_AROUND_RE = re.compile(r"(?:预算|月租|价格|房租).*?(\d{3,5})\s*(?:左右|上下)", re.I)
+_PRICE_AROUND_RE = re.compile(r"(?:预算|月租|价格|房租|租金).*?(\d{3,5})\s*(?:左右|上下)", re.I)
 _AREA_MIN_RE = re.compile(r"(\d{2,3})\s*(?:平|㎡)(?:以上|米以上)?")
 _COMMUTE_RE = re.compile(r"通勤\s*(\d{1,3})\s*分钟")
 _SUBWAY_LINE_RE = re.compile(r"(\d{1,2})号线")
@@ -191,6 +193,66 @@ TAG_RULES: list[tuple[list[str], list[str], list[str], list[tuple[str, str, Any]
 
 # ── Price parser ───────────────────────────────────────────────────────
 
+_CN_DIGIT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+             "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "零": 0, "〇": 0}
+
+_CN_PRICE_RE = re.compile(
+    r"([一二两三四五六七八九十]+万[一二两三四五六七八九十百千零]*"
+    r"|[一二两三四五六七八九十]+千[一二两三四五六七八九百零]*)"
+)
+
+
+def _parse_cn_price(s: str) -> int | None:
+    """Parse Chinese numeral price strings like 一千二=1200, 一万五=15000."""
+    if not s:
+        return None
+
+    total = 0
+    if "万" in s:
+        parts = s.split("万", 1)
+        wan_digit = _CN_DIGIT.get(parts[0], 0)
+        total += wan_digit * 10000
+        rest = parts[1] if len(parts) > 1 else ""
+    else:
+        rest = s
+
+    if "千" in rest:
+        parts2 = rest.split("千", 1)
+        qian_digit = _CN_DIGIT.get(parts2[0], 0)
+        total += qian_digit * 1000
+        rest2 = parts2[1] if len(parts2) > 1 else ""
+    elif "万" in s and rest:
+        digit = _CN_DIGIT.get(rest.rstrip("百零"), 0)
+        if digit:
+            total += digit * 1000
+        return total if total > 0 else None
+    else:
+        rest2 = rest
+
+    if rest2:
+        digit = _CN_DIGIT.get(rest2.rstrip("百零"), 0)
+        if "百" in rest2:
+            bai_parts = rest2.split("百", 1)
+            digit = _CN_DIGIT.get(bai_parts[0], 0)
+            total += digit * 100
+        elif digit:
+            total += digit * 100
+
+    return total if total > 0 else None
+
+
+_CN_PRICE_MAX_RE = re.compile(
+    r"(?:预算|月租|价格|房租|租金).*?"
+    r"([一二两三四五六七八九十]+[千万][一二两三四五六七八九百千零]*)"
+    r"\s*(?:元|块)?(?:以[下内里]|以内|之内|左右|上下)?"
+)
+
+_CN_PRICE_STANDALONE_RE = re.compile(
+    r"([一二两三四五六七八九十]+[千万][一二两三四五六七八九百千零]*)"
+    r"\s*(?:元|块)(?:以[下内里]|以内|之内)?"
+)
+
+
 def _parse_price(s: str) -> int:
     s = s.lower().strip()
     if "k" in s:
@@ -216,9 +278,12 @@ def classify_intent(msg: str, has_candidates: bool, turn: int) -> Intent:
     if m in ("再见", "拜拜", "bye", "结束"):
         return Intent.BYE
 
-    # Terminate
-    if any(p in msg for p in ("退租", "退掉", "我要退", "帮我退租", "帮我退掉")):
-        return Intent.TERMINATE
+    # Terminate -- only if user is actually canceling, not searching for flexible terms
+    _terminate_kws = ("退租", "退掉", "我要退", "帮我退租", "帮我退掉")
+    _terminate_search_ctx = ("协商", "可以", "希望", "需要", "万一", "灵活", "支持", "可协商", "提前")
+    if any(p in msg for p in _terminate_kws):
+        if not any(ctx in msg for ctx in _terminate_search_ctx):
+            return Intent.TERMINATE
 
     # Rent intent
     rent_pats = [
@@ -262,17 +327,20 @@ def classify_intent(msg: str, has_candidates: bool, turn: int) -> Intent:
     # General search intent
     search_kws = ["找", "租", "房", "居室", "居", "套", "单间", "推荐", "看看", "希望", "想要", "预算", "有没有", "有吗"]
     if any(kw in msg for kw in search_kws):
-        # If we already have candidates and this looks like adding conditions -> FILTER
         if has_candidates and turn > 1:
             new_params = extract_search_params(msg)
-            # If the only new thing is params we already have, treat as filter
             has_new_district = new_params.get("district") is not None
             if not has_new_district:
                 filter_kws = _extract_tag_specs(msg)
                 if filter_kws["tags_require"] or filter_kws["tags_exclude"] or filter_kws["field_filters"]:
                     return Intent.FILTER
-                # Check if user is changing price/bedrooms etc. -> new search
-                if any(new_params.get(k) for k in ("max_price", "min_price", "bedrooms", "decoration", "max_subway_dist")):
+                if any(new_params.get(k) for k in (
+                    "max_price", "min_price", "bedrooms", "decoration",
+                    "max_subway_dist", "rental_type", "elevator", "orientation",
+                )):
+                    return Intent.FILTER
+                # "也可以/也行" patterns indicate relaxing a constraint, not new search
+                if any(p in msg for p in ("也可以", "也行", "也ok", "也没关系", "都行", "都可以")):
                     return Intent.FILTER
         return Intent.SEARCH
 
@@ -289,11 +357,25 @@ def extract_search_params(msg: str) -> dict[str, Any]:
     """Extract structured search parameters from user message."""
     params: dict[str, Any] = {}
 
-    # District
-    for d in DISTRICTS:
-        if d in msg:
-            params["district"] = d
-            break
+    # District -- prefer contextual patterns like "在X上班" / "在X工作"
+    _target_district_re = re.compile(
+        r"(?:在|去|到)([" + "|".join(DISTRICTS) + r"])(?:上班|工作|那边|那里|找|租|住|那儿)"
+    )
+    target_m = _target_district_re.search(msg)
+    if target_m:
+        params["district"] = target_m.group(1)
+    else:
+        # Also check for "希望在她上班的区" -> use the last mentioned district
+        all_found = [d for d in DISTRICTS if d in msg]
+        if len(all_found) > 1 and any(kw in msg for kw in ("上班的区", "她那边", "他那边", "那个区")):
+            for d in DISTRICTS:
+                if re.search(rf"在{d}(?:上班|工作)", msg):
+                    params["district"] = d
+                    break
+            else:
+                params["district"] = all_found[-1]
+        elif all_found:
+            params["district"] = all_found[0]
     if not params.get("district"):
         for lm, (dist, _) in LANDMARK_KEYWORDS.items():
             if lm in msg:
@@ -313,18 +395,29 @@ def extract_search_params(msg: str) -> dict[str, Any]:
     if range_m:
         p1 = _parse_price(range_m.group(1))
         p2 = _parse_price(range_m.group(2))
-        params["min_price"] = min(p1, p2)
-        params["max_price"] = max(p1, p2)
+        if min(p1, p2) >= 100:
+            params["min_price"] = min(p1, p2)
+            params["max_price"] = max(p1, p2)
     else:
         around_m = _PRICE_AROUND_RE.search(msg)
         if around_m:
             base = int(around_m.group(1))
-            params["min_price"] = int(base * 0.7)
             params["max_price"] = int(base * 1.3)
         else:
             price_m = _PRICE_MAX_RE.search(msg) or _PRICE_MAX_RE2.search(msg)
             if price_m:
                 params["max_price"] = _parse_price(price_m.group(1))
+            else:
+                cn_m = _CN_PRICE_MAX_RE.search(msg) or _CN_PRICE_STANDALONE_RE.search(msg)
+                if cn_m:
+                    cn_val = _parse_cn_price(cn_m.group(1))
+                    if cn_val and cn_val >= 100:
+                        if "左右" in msg or "上下" in msg:
+                            params["max_price"] = int(cn_val * 1.3)
+                        elif any(kw in msg for kw in ("以下", "以内", "之内")):
+                            params["max_price"] = cn_val
+                        else:
+                            params["max_price"] = cn_val
 
     # Area
     area_m = _AREA_MIN_RE.search(msg)
