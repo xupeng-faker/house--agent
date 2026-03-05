@@ -639,6 +639,9 @@ def _is_clarification_only_payment(msg: str) -> bool:
     # 排除含明确筛选条件的（户型、区县、预算等）
     if any(k in msg for k in ["两居", "三居", "朝阳", "海淀", "预算", "三千", "四千", "找房", "推荐"]):
         return False
+    # 排除指向上一轮房源的追加条件表述，优先走多轮筛选
+    if any(k in msg for k in ["这些", "这几套", "能不能", "可以吗", "有没有", "能月付", "月付吗"]):
+        return False
     return len(msg.strip()) < 50
 
 
@@ -1309,7 +1312,7 @@ async def _secondary_quality_check(
     candidate_set = set(candidate_house_ids)
     summary = _extract_requirements_summary(messages) or "无"
     house_details_lines: list[str] = []
-    for hid in candidate_house_ids[:10]:
+    for hid in candidate_house_ids[:50]:
         if _is_likely_fake_house_id(hid):
             continue
         try:
@@ -1973,11 +1976,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
             except (json.JSONDecodeError, TypeError):
                 user_house_ids = []
             qc_input_house_ids: list[str] | None = None
-            if ENABLE_SECONDARY_QUALITY_CHECK and user_house_ids:
-                qc_input_house_ids = list(user_house_ids)
+            if ENABLE_SECONDARY_QUALITY_CHECK and full_ids:
+                qc_input_house_ids = list(full_ids)
                 direct_result = await _secondary_quality_check(
                     req.model_ip, user_id, user_message, get_messages(session_id),
-                    user_house_ids, direct_result,
+                    full_ids, direct_result,
                 )
                 try:
                     user_house_ids = json.loads(direct_result).get("houses") or []
@@ -2046,6 +2049,46 @@ async def chat(req: ChatRequest) -> ChatResponse:
             tool_results=tool_results, timestamp=int(start_ts), duration_ms=dur,
         )
 
+    # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
+    # 优先于澄清型短路执行：有上轮候选且当前句含筛选条件时先做多轮筛选，避免误判为「仅问付款」
+    house_ids_to_filter = get_last_search_house_ids(session_id) or last_house_ids
+    filter_specs = _get_all_filters_from_message(user_message)
+    if "压一半" in user_message and last_house_ids:
+        filter_specs = await _merge_budget_half_spec(user_message, last_house_ids, user_id, filter_specs)
+    if filter_specs and house_ids_to_filter:
+        filter_result = await _do_multi_turn_filter(house_ids_to_filter, filter_specs, user_id)
+        if filter_result:
+            result_str, tool_results, matched_ids = filter_result
+            try:
+                user_house_ids = json.loads(result_str).get("houses") or []
+            except (json.JSONDecodeError, TypeError):
+                user_house_ids = []
+            qc_input_house_ids_mt: list[str] | None = None
+            if ENABLE_SECONDARY_QUALITY_CHECK and matched_ids:
+                qc_input_house_ids_mt = list(matched_ids)
+                msgs_with_current = get_messages(session_id) + [{"role": "user", "content": user_message}]
+                result_str = await _secondary_quality_check(
+                    req.model_ip, user_id, user_message, msgs_with_current,
+                    matched_ids, result_str,
+                )
+                try:
+                    user_house_ids = json.loads(result_str).get("houses") or []
+                except (json.JSONDecodeError, TypeError):
+                    user_house_ids = []
+            log_filter(session_id, "multi_turn_filter", matched_ids, user_house_ids, qc_input_house_ids=qc_input_house_ids_mt)
+            if matched_ids:
+                set_last_search_house_ids(session_id, matched_ids)
+            start_ts = time.time()
+            append_messages(session_id, {"role": "user", "content": user_message})
+            append_messages(session_id, {"role": "assistant", "content": result_str})
+            dur = int((time.time() - start_ts) * 1000)
+            log_response(session_id, "success", dur, result_str)
+            log_request_response(session_id, user_message, result_str)
+            return ChatResponse(
+                session_id=session_id, response=result_str, status="success",
+                tool_results=tool_results, timestamp=int(start_ts), duration_ms=dur,
+            )
+
     # --- 短路 5.5：澄清型（仅问付款/房东，无其他条件）---
     if last_house_ids and _is_clarification_only_payment(user_message):
         canned = "好的，您更倾向哪个区域？预算多少？我可以帮您找押一付一的房源。"
@@ -2067,46 +2110,6 @@ async def chat(req: ChatRequest) -> ChatResponse:
             session_id=session_id, response=canned, status="success",
             tool_results=[], timestamp=int(time.time()), duration_ms=0,
         )
-
-    # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
-    # 优先使用完整筛选池；无则回退到推荐 5 套
-    house_ids_to_filter = get_last_search_house_ids(session_id) or last_house_ids
-    filter_specs = _get_all_filters_from_message(user_message)
-    if "压一半" in user_message and last_house_ids:
-        filter_specs = await _merge_budget_half_spec(user_message, last_house_ids, user_id, filter_specs)
-    if filter_specs and house_ids_to_filter:
-        filter_result = await _do_multi_turn_filter(house_ids_to_filter, filter_specs, user_id)
-        if filter_result:
-            result_str, tool_results, matched_ids = filter_result
-            try:
-                user_house_ids = json.loads(result_str).get("houses") or []
-            except (json.JSONDecodeError, TypeError):
-                user_house_ids = []
-            qc_input_house_ids_mt: list[str] | None = None
-            if ENABLE_SECONDARY_QUALITY_CHECK and user_house_ids:
-                qc_input_house_ids_mt = list(user_house_ids)
-                msgs_with_current = get_messages(session_id) + [{"role": "user", "content": user_message}]
-                result_str = await _secondary_quality_check(
-                    req.model_ip, user_id, user_message, msgs_with_current,
-                    user_house_ids, result_str,
-                )
-                try:
-                    user_house_ids = json.loads(result_str).get("houses") or []
-                except (json.JSONDecodeError, TypeError):
-                    user_house_ids = []
-            log_filter(session_id, "multi_turn_filter", matched_ids, user_house_ids, qc_input_house_ids=qc_input_house_ids_mt)
-            if matched_ids:
-                set_last_search_house_ids(session_id, matched_ids)
-            start_ts = time.time()
-            append_messages(session_id, {"role": "user", "content": user_message})
-            append_messages(session_id, {"role": "assistant", "content": result_str})
-            dur = int((time.time() - start_ts) * 1000)
-            log_response(session_id, "success", dur, result_str)
-            log_request_response(session_id, user_message, result_str)
-            return ChatResponse(
-                session_id=session_id, response=result_str, status="success",
-                tool_results=tool_results, timestamp=int(start_ts), duration_ms=dur,
-            )
 
     append_messages(session_id, {"role": "user", "content": user_message})
     messages = get_messages(session_id)
@@ -2196,17 +2199,13 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 except (json.JSONDecodeError, TypeError):
                     user_house_ids = []
             qc_input_house_ids_llm: list[str] | None = None
-            if ENABLE_SECONDARY_QUALITY_CHECK and response_text:
-                try:
-                    qc_house_ids = json.loads(response_text).get("houses") or []
-                except (json.JSONDecodeError, TypeError):
-                    qc_house_ids = []
-                if qc_house_ids:
-                    qc_input_house_ids_llm = list(qc_house_ids)
-                    response_text = await _secondary_quality_check(
-                        req.model_ip, user_id, user_message, get_messages(session_id),
-                        qc_house_ids, response_text,
-                    )
+            full_ids_llm = list(dict.fromkeys(full_ids_from_search))
+            if ENABLE_SECONDARY_QUALITY_CHECK and response_text and full_ids_llm:
+                qc_input_house_ids_llm = full_ids_llm
+                response_text = await _secondary_quality_check(
+                    req.model_ip, user_id, user_message, get_messages(session_id),
+                    full_ids_llm, response_text,
+                )
             try:
                 final_house_ids = json.loads(response_text).get("houses") or [] if response_text else []
             except (json.JSONDecodeError, TypeError):
@@ -2281,17 +2280,13 @@ async def chat(req: ChatRequest) -> ChatResponse:
         else:
             response_text = json.dumps({"message": "暂无符合要求的房源，建议调整条件或更换区域", "houses": []}, ensure_ascii=False)
         qc_input_fallback: list[str] | None = None
-        if ENABLE_SECONDARY_QUALITY_CHECK and response_text:
-            try:
-                qc_house_ids = json.loads(response_text).get("houses") or []
-            except (json.JSONDecodeError, TypeError):
-                qc_house_ids = []
-            if qc_house_ids:
-                qc_input_fallback = list(qc_house_ids)
-                response_text = await _secondary_quality_check(
-                    req.model_ip, user_id, user_message, get_messages(session_id),
-                    qc_house_ids, response_text,
-                )
+        full_ids_fallback = list(valid_house_ids) if valid_house_ids else list(dict.fromkeys(full_ids_from_search))
+        if ENABLE_SECONDARY_QUALITY_CHECK and response_text and full_ids_fallback:
+            qc_input_fallback = full_ids_fallback
+            response_text = await _secondary_quality_check(
+                req.model_ip, user_id, user_message, get_messages(session_id),
+                full_ids_fallback, response_text,
+            )
         try:
             final_ids_fallback = json.loads(response_text).get("houses") or []
         except (json.JSONDecodeError, TypeError):
