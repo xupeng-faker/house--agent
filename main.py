@@ -2166,9 +2166,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     valid_house_ids.add(hid)
                 if tr.get("name") in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community") and ids:
                     full_ids_from_search.extend(ids)
+            # 多轮用「上次筛选/质检的全量」：有搜索工具全量则存之，否则存本轮所有工具结果中的 ID 全量
             if full_ids_from_search:
                 set_last_search_house_ids(session_id, list(dict.fromkeys(full_ids_from_search)))
-            
+            elif valid_house_ids:
+                set_last_search_house_ids(session_id, list(valid_house_ids))
+
             # 尝试修复误输出的 tool call 文本
             parsed = _parse_tool_call_content(response_text)
             if parsed:
@@ -2269,8 +2272,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 valid_house_ids.add(hid)
             if tr.get("name") in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community") and ids:
                 full_ids_from_search.extend(ids)
-        if full_ids_from_search:
-            set_last_search_house_ids(session_id, list(dict.fromkeys(full_ids_from_search)))
+        # 多轮用「上次筛选/质检的全量」：优先存搜索工具全量，否则存本轮所有工具结果 ID 全量
+        full_ids_for_next = list(dict.fromkeys(full_ids_from_search)) if full_ids_from_search else (list(valid_house_ids) if valid_house_ids else [])
+        if full_ids_for_next:
+            set_last_search_house_ids(session_id, full_ids_for_next)
         if valid_house_ids:
             ids_list = list(valid_house_ids)[:5]
             tool_outputs_raw = [tr.get("output", "") for tr in tool_results if tr.get("output")]
