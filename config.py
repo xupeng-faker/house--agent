@@ -6,3 +6,6 @@ FAKE_APP_BASE_URL = os.getenv("FAKE_APP_BASE_URL", "http://localhost:8080")
 
 # 模型服务端口（固定）
 MODEL_PORT = 8888
+
+# 返回房源前是否启用模型二次质检筛选（根据用户需求与房源详情再筛一轮）
+ENABLE_SECONDARY_QUALITY_CHECK = os.getenv("ENABLE_SECONDARY_QUALITY_CHECK", "true").lower() in ("1", "true", "yes")

@@ -143,3 +143,46 @@ def log_request_response(session_id: str, request_message: str, response_content
         "response_content": response_content,
     }, ensure_ascii=False, indent=2)
     _reqresp_logger.info("请求响应 | %s", payload)
+
+
+# ---- 筛选日志（JSON 行格式：每次筛选的消息名称、全集、给用户的房源）----
+
+_filter_logger = logging.getLogger("filter")
+_filter_logger.setLevel(logging.DEBUG)
+_filter_logger.propagate = False
+_filter_logger.addHandler(_console)
+_filter_file_handler = TimedRotatingFileHandler(
+    os.path.join(LOG_DIR, "filter.log"),
+    when="midnight",
+    interval=1,
+    backupCount=7,
+    encoding="utf-8",
+)
+_filter_file_handler.setFormatter(logging.Formatter("%(message)s"))
+_filter_logger.addHandler(_filter_file_handler)
+
+
+def log_filter(
+    session_id: str,
+    message_name: str,
+    full_house_ids: list[str],
+    user_house_ids: list[str],
+    qc_input_house_ids: list[str] | None = None,
+) -> None:
+    """记录每次筛选：消息名称、筛选出来房源的全集、给用户的房源；若经过二次质检则记录质检前后列表。JSON 格式，一行一条。"""
+    from datetime import datetime
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "session_id": session_id,
+        "message_name": message_name,
+        "full_house_ids": full_house_ids,
+        "user_house_ids": user_house_ids,
+    }
+    if qc_input_house_ids is not None:
+        payload["secondary_qc_applied"] = True
+        payload["qc_input_house_ids"] = qc_input_house_ids
+        payload["qc_output_house_ids"] = user_house_ids
+    else:
+        payload["secondary_qc_applied"] = False
+    line = json.dumps(payload, ensure_ascii=False)
+    _filter_logger.info("%s", line)

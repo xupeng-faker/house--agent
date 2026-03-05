@@ -10,8 +10,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from config import ENABLE_SECONDARY_QUALITY_CHECK
 from llm_client import chat_completions, parse_assistant_message
-from logger import log_request, log_request_response, log_response, service_log, tool_log
+from logger import log_filter, log_request, log_request_response, log_response, service_log, tool_log
 from prompts import SYSTEM_PROMPT
 from rental_tools import get_tools_schema, init_houses, run_tool
 from session_store import (
@@ -226,7 +227,9 @@ def _has_minimal_search_params(name: str, args: dict) -> bool:
     return bool(args)
 
 
-async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str | None:
+async def _try_execute_tool_call_from_content(
+    content: str, user_id: str, session_id: str | None = None
+) -> str | None:
     """尝试将 content 中的 tool call 形态解析并执行，返回格式化结果或 None。"""
     parsed = _parse_tool_call_content(content)
     if not parsed:
@@ -247,10 +250,12 @@ async def _try_execute_tool_call_from_content(content: str, user_id: str) -> str
             return None
         data = json.loads(raw)
         items = _filter_available_only(_extract_items(data) or [])
-        house_ids = [str(i.get("house_id") or i.get("id") or "") for i in items if isinstance(i, dict) and (i.get("house_id") or i.get("id"))]
-        house_ids = house_ids[:5]
-        msg = f"为您找到{len(house_ids)}套符合条件的房源" if house_ids else "暂无符合条件的房源，建议调整筛选条件"
-        return json.dumps({"message": msg, "houses": house_ids}, ensure_ascii=False)
+        full_house_ids = [str(i.get("house_id") or i.get("id") or "") for i in items if isinstance(i, dict) and (i.get("house_id") or i.get("id"))]
+        user_house_ids = full_house_ids[:5]
+        if session_id:
+            log_filter(session_id, name, full_house_ids, user_house_ids)
+        msg = f"为您找到{len(user_house_ids)}套符合条件的房源" if user_house_ids else "暂无符合条件的房源，建议调整筛选条件"
+        return json.dumps({"message": msg, "houses": user_house_ids}, ensure_ascii=False)
     except (json.JSONDecodeError, Exception) as e:
         service_log.warning("[TOOL_CALL_FALLBACK] 兜底执行失败: %s", e)
         return None
@@ -1267,6 +1272,91 @@ async def _do_multi_turn_filter(
     return (json.dumps({"message": msg, "houses": []}, ensure_ascii=False), [], [])
 
 
+def _house_detail_summary_for_quality_check(h: dict) -> str:
+    """将单条房源转为质检用的简短摘要（小区、价格、类型、tags、安静/民水民电/朝向/电梯等）。"""
+    parts = []
+    hid = str(h.get("house_id") or h.get("id") or "")
+    community = str(h.get("community") or h.get("community_name") or "")
+    price = h.get("price") or 0
+    rental_type = str(h.get("rental_type") or "")
+    parts.append(f"ID={hid} 小区={community} 价格={price}元/月 租住类型={rental_type}")
+    tags = h.get("tags") or []
+    if tags:
+        parts.append("tags=" + "、".join(str(t) for t in tags[:15]))
+    for key, label in (
+        ("hidden_noise_level", "安静程度"),
+        ("utilities_type", "水电类型"),
+        ("orientation", "朝向"),
+        ("elevator", "电梯"),
+    ):
+        val = h.get(key)
+        if val is not None and val != "":
+            parts.append(f"{label}={val}")
+    return " | ".join(parts)
+
+
+async def _secondary_quality_check(
+    model_ip: str,
+    user_id: str,
+    user_message: str,
+    messages: list[dict],
+    candidate_house_ids: list[str],
+    current_response_json: str,
+) -> str:
+    """在返回前用模型对「用户需求+房源详情」做二次质检，只保留符合用户全部要求的房源，最多5个。"""
+    if not candidate_house_ids:
+        return current_response_json
+    candidate_set = set(candidate_house_ids)
+    summary = _extract_requirements_summary(messages) or "无"
+    house_details_lines: list[str] = []
+    for hid in candidate_house_ids[:10]:
+        if _is_likely_fake_house_id(hid):
+            continue
+        try:
+            raw = await run_tool("get_house_by_id", {"house_id": hid}, user_id)
+            data = json.loads(raw)
+            h = data.get("data") or data.get("house") or data
+            if isinstance(h, dict):
+                house_details_lines.append(_house_detail_summary_for_quality_check(h))
+        except Exception:
+            continue
+    if not house_details_lines:
+        return current_response_json
+    prompt = f"""用户历史需求摘要：{summary}
+当前用户消息：{user_message}
+
+候选房源详情（每行一套）：
+"""
+    prompt += "\n".join(house_details_lines)
+    prompt += """
+
+请根据用户全部要求对上述房源做二次质检筛选，只保留完全符合用户需求的房源（最多5个），不符合的剔除。严格输出一行 JSON，格式：{"message": "简短回复，可列房源列表", "houses": ["HF_xx", ...]}，houses 中的 ID 必须来自上面候选列表，不要输出其他内容或 Markdown。"""
+    try:
+        response = await chat_completions(model_ip, [{"role": "user", "content": prompt}], tools=None)
+        content, _ = parse_assistant_message(response)
+        if not content or not content.strip():
+            return current_response_json
+        extracted = _try_extract_json(content)
+        if not extracted:
+            return current_response_json
+        d = json.loads(extracted)
+        houses = d.get("houses") or []
+        if not isinstance(houses, list):
+            return current_response_json
+        normalized = []
+        for h in houses[:5]:
+            hid = _normalize_house_id(h)
+            if hid and hid in candidate_set:
+                normalized.append(hid)
+        message = _strip_markdown(d.get("message", ""))
+        if not message:
+            message = "为您找到{}套符合条件的房源".format(len(normalized))
+        return json.dumps({"message": message, "houses": normalized}, ensure_ascii=False)
+    except Exception as e:
+        service_log.warning("[SECONDARY_QC] session check failed: %s", e)
+        return current_response_json
+
+
 def _try_direct_search(msg: str) -> dict | list[dict] | None:
     """从明确的租房需求中提取参数，直接构建 API 查询参数。"""
     if any(kw in msg for kw in ["办理", "预约", "退租", "退掉", "下架"]):
@@ -1812,6 +1902,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         append_messages(session_id, {"role": "user", "content": user_message})
         tool_name = ""
         tool_output = ""
+        full_ids: list[str] = []
         # 2a: 小区查询
         community = _try_community_query(user_message)
         if community:
@@ -1877,6 +1968,22 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     service_log.warning("[SHORT] session=%s 直接搜索失败: %s", session_id, e)
         if tool_output:
             direct_result = _ensure_strict_json_response(tool_output)
+            try:
+                user_house_ids = json.loads(direct_result).get("houses") or []
+            except (json.JSONDecodeError, TypeError):
+                user_house_ids = []
+            qc_input_house_ids: list[str] | None = None
+            if ENABLE_SECONDARY_QUALITY_CHECK and user_house_ids:
+                qc_input_house_ids = list(user_house_ids)
+                direct_result = await _secondary_quality_check(
+                    req.model_ip, user_id, user_message, get_messages(session_id),
+                    user_house_ids, direct_result,
+                )
+                try:
+                    user_house_ids = json.loads(direct_result).get("houses") or []
+                except (json.JSONDecodeError, TypeError):
+                    user_house_ids = []
+            log_filter(session_id, tool_name or "search", full_ids, user_house_ids, qc_input_house_ids=qc_input_house_ids)
             dur = int((time.time() - start_ts) * 1000)
             log_response(session_id, "success", dur, direct_result)
             log_request_response(session_id, user_message, direct_result)
@@ -1971,6 +2078,23 @@ async def chat(req: ChatRequest) -> ChatResponse:
         filter_result = await _do_multi_turn_filter(house_ids_to_filter, filter_specs, user_id)
         if filter_result:
             result_str, tool_results, matched_ids = filter_result
+            try:
+                user_house_ids = json.loads(result_str).get("houses") or []
+            except (json.JSONDecodeError, TypeError):
+                user_house_ids = []
+            qc_input_house_ids_mt: list[str] | None = None
+            if ENABLE_SECONDARY_QUALITY_CHECK and user_house_ids:
+                qc_input_house_ids_mt = list(user_house_ids)
+                msgs_with_current = get_messages(session_id) + [{"role": "user", "content": user_message}]
+                result_str = await _secondary_quality_check(
+                    req.model_ip, user_id, user_message, msgs_with_current,
+                    user_house_ids, result_str,
+                )
+                try:
+                    user_house_ids = json.loads(result_str).get("houses") or []
+                except (json.JSONDecodeError, TypeError):
+                    user_house_ids = []
+            log_filter(session_id, "multi_turn_filter", matched_ids, user_house_ids, qc_input_house_ids=qc_input_house_ids_mt)
             if matched_ids:
                 set_last_search_house_ids(session_id, matched_ids)
             start_ts = time.time()
@@ -2045,7 +2169,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
             # 尝试修复误输出的 tool call 文本
             parsed = _parse_tool_call_content(response_text)
             if parsed:
-                fallback_result = await _try_execute_tool_call_from_content(response_text, user_id)
+                fallback_result = await _try_execute_tool_call_from_content(response_text, user_id, session_id)
                 if fallback_result:
                     try:
                         fb = json.loads(fallback_result)
@@ -2067,7 +2191,27 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     valid_house_ids or None,
                     tool_outputs=tool_outputs_for_reformat,
                 )
-                
+                try:
+                    user_house_ids = json.loads(response_text).get("houses") or []
+                except (json.JSONDecodeError, TypeError):
+                    user_house_ids = []
+            qc_input_house_ids_llm: list[str] | None = None
+            if ENABLE_SECONDARY_QUALITY_CHECK and response_text:
+                try:
+                    qc_house_ids = json.loads(response_text).get("houses") or []
+                except (json.JSONDecodeError, TypeError):
+                    qc_house_ids = []
+                if qc_house_ids:
+                    qc_input_house_ids_llm = list(qc_house_ids)
+                    response_text = await _secondary_quality_check(
+                        req.model_ip, user_id, user_message, get_messages(session_id),
+                        qc_house_ids, response_text,
+                    )
+            try:
+                final_house_ids = json.loads(response_text).get("houses") or [] if response_text else []
+            except (json.JSONDecodeError, TypeError):
+                final_house_ids = []
+            log_filter(session_id, "model_tool_round", list(dict.fromkeys(full_ids_from_search)), final_house_ids, qc_input_house_ids=qc_input_house_ids_llm)
             append_messages(session_id, {"role": "assistant", "content": response_text})
             break
 
@@ -2136,6 +2280,23 @@ async def chat(req: ChatRequest) -> ChatResponse:
             response_text = json.dumps({"message": msg, "houses": ids_list}, ensure_ascii=False)
         else:
             response_text = json.dumps({"message": "暂无符合要求的房源，建议调整条件或更换区域", "houses": []}, ensure_ascii=False)
+        qc_input_fallback: list[str] | None = None
+        if ENABLE_SECONDARY_QUALITY_CHECK and response_text:
+            try:
+                qc_house_ids = json.loads(response_text).get("houses") or []
+            except (json.JSONDecodeError, TypeError):
+                qc_house_ids = []
+            if qc_house_ids:
+                qc_input_fallback = list(qc_house_ids)
+                response_text = await _secondary_quality_check(
+                    req.model_ip, user_id, user_message, get_messages(session_id),
+                    qc_house_ids, response_text,
+                )
+        try:
+            final_ids_fallback = json.loads(response_text).get("houses") or []
+        except (json.JSONDecodeError, TypeError):
+            final_ids_fallback = []
+        log_filter(session_id, "tool_round_merge", list(dict.fromkeys(full_ids_from_search)), final_ids_fallback, qc_input_house_ids=qc_input_fallback)
         append_messages(session_id, {"role": "assistant", "content": response_text})
 
     duration_ms = int((time.time() - start_ts) * 1000)
