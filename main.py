@@ -2159,6 +2159,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 except (json.JSONDecodeError, TypeError):
                     user_house_ids = []
             log_filter(session_id, tool_name or "search", full_ids, user_house_ids, qc_input_house_ids=qc_input_house_ids)
+            # 首轮有房源时必须存全量，供第二轮多轮筛选使用；若本分支未设置过（full_ids 为空）则用本次展示的 user_house_ids 兜底
+            if not get_last_search_house_ids(session_id) and user_house_ids:
+                set_last_search_house_ids(session_id, user_house_ids)
             dur = int((time.time() - start_ts) * 1000)
             log_response(session_id, "success", dur, direct_result)
             log_request_response(session_id, user_message, direct_result)
@@ -2224,6 +2227,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
     # --- 短路 6：多轮追加筛选（get_house_by_id 过滤）---
     # 优先于澄清型短路执行：有上轮候选且当前句含筛选条件时先做多轮筛选，避免误判为「仅问付款」
     house_ids_to_filter = get_last_search_house_ids(session_id) or last_house_ids
+    # 若 session 从未存过全量（首轮漏设），用上一轮回复中的 last_house_ids 补写，保证第二轮起 full_house_ids 可用
+    if not get_last_search_house_ids(session_id) and house_ids_to_filter:
+        set_last_search_house_ids(session_id, list(house_ids_to_filter))
     filter_specs = _get_all_filters_from_message(user_message)
     if "压一半" in user_message and last_house_ids:
         filter_specs = await _merge_budget_half_spec(user_message, last_house_ids, user_id, filter_specs)
@@ -2248,8 +2254,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 except (json.JSONDecodeError, TypeError):
                     user_house_ids = []
             log_filter(session_id, "multi_turn_filter", matched_ids, user_house_ids, qc_input_house_ids=qc_input_house_ids_mt)
-            # 质检只做质检：全量仍用筛选前的 house_ids_to_filter，不改为 matched_ids；显式写回供下一轮使用
-            set_last_search_house_ids(session_id, house_ids_to_filter)
+            # 质检只做质检：不修改上次筛选的全量房源，不把 matched_ids 写回 session，下一轮仍用原全量
             start_ts = time.time()
             append_messages(session_id, {"role": "user", "content": user_message})
             append_messages(session_id, {"role": "assistant", "content": result_str})
@@ -2338,9 +2343,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
                     valid_house_ids.add(hid)
                 if tr.get("name") in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community") and ids:
                     full_ids_from_search.extend(ids)
-            # 多轮用「上次筛选/质检的全量」：仅当本轮有搜索工具结果时更新全量，避免用 get_house_by_id 的少量 ID 覆盖
+            # 多轮用「上次筛选/质检的全量」：有搜索工具全量则存之，否则存本轮所有工具结果中的 ID 全量
             if full_ids_from_search:
                 set_last_search_house_ids(session_id, list(dict.fromkeys(full_ids_from_search)))
+            elif valid_house_ids:
+                set_last_search_house_ids(session_id, list(valid_house_ids))
 
             # 尝试修复误输出的 tool call 文本
             parsed = _parse_tool_call_content(response_text)
@@ -2442,9 +2449,10 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 valid_house_ids.add(hid)
             if tr.get("name") in ("get_houses_by_platform", "get_houses_nearby", "get_houses_by_community") and ids:
                 full_ids_from_search.extend(ids)
-        # 多轮用「上次筛选/质检的全量」：仅当本轮有搜索工具结果时更新全量，避免多轮后全量被覆盖为空
-        if full_ids_from_search:
-            set_last_search_house_ids(session_id, list(dict.fromkeys(full_ids_from_search)))
+        # 多轮用「上次筛选/质检的全量」：优先存搜索工具全量，否则存本轮所有工具结果 ID 全量
+        full_ids_for_next = list(dict.fromkeys(full_ids_from_search)) if full_ids_from_search else (list(valid_house_ids) if valid_house_ids else [])
+        if full_ids_for_next:
+            set_last_search_house_ids(session_id, full_ids_for_next)
         if valid_house_ids:
             ids_list = list(valid_house_ids)[:5]
             tool_outputs_raw = [tr.get("output", "") for tr in tool_results if tr.get("output")]
